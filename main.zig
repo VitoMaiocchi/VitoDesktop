@@ -10,10 +10,21 @@ const cairo = @cImport({
     @cInclude("cairo/cairo.h");
 });
 
+const OutputInfo = struct {
+    output: *wl.Output,
+    name: u32, // the wl_registry global name, useful as a stable key
+    width: i32 = 0,
+    height: i32 = 0,
+    scale: i32 = 1,
+    done: bool = false, // set once compositor signals this output's info is complete
+};
+
 const Globals = struct {
     shm: ?*wl.Shm,
     compositor: ?*wl.Compositor,
     layer_shell: ?*zwlr.LayerShellV1,
+    outputs: std.ArrayList(OutputInfo),
+    allocator: std.mem.Allocator,
 };
 
 const State = struct {
@@ -30,10 +41,19 @@ pub fn main() anyerror!void {
     const registry = try display.getRegistry();
     defer registry.destroy();
 
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked == .leak) std.debug.print("memory leak detected\n", .{});
+    }
+    const allocator = gpa.allocator();
+
     var globals = Globals{
         .shm = null,
         .compositor = null,
         .layer_shell = null,
+        .outputs = std.ArrayList(OutputInfo).empty,
+        .allocator = allocator,
     };
 
     registry.setListener(*Globals, registryListener, &globals);
@@ -77,7 +97,6 @@ pub fn main() anyerror!void {
     }
 
     const buffer = blk: {
-        std.debug.print("state size: {}, {}", .{ state.width, state.height });
         const width = state.width;
         const height = state.height;
         const stride = width * 4;
@@ -139,14 +158,29 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
     switch (event) {
         .global => |global| {
             if (mem.orderZ(u8, global.interface, wl.Compositor.interface.name) == .eq) {
-                globals.compositor = registry.bind(global.name, wl.Compositor, 1) catch return;
+                globals.compositor = registry.bind(global.name, wl.Compositor, 4) catch return;
             } else if (mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
                 globals.shm = registry.bind(global.name, wl.Shm, 1) catch return;
             } else if (mem.orderZ(u8, global.interface, zwlr.LayerShellV1.interface.name) == .eq) {
                 globals.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, 1) catch return;
+            } else if (mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
+                const output = registry.bind(global.name, wl.Output, 4) catch return; // v2+ for scale event
+                globals.outputs.append(globals.allocator, .{ .output = output, .name = global.name }) catch return;
+                const info = &globals.outputs.items[globals.outputs.items.len - 1];
+                output.setListener(*OutputInfo, outputListener, info);
+                std.debug.print("output {} has been created\n", .{info.name});
             }
         },
-        .global_remove => {},
+        .global_remove => |remove| {
+            for (globals.outputs.items, 0..) |o, i| {
+                if (o.name == remove.name) {
+                    o.output.release(); // or .destroy() depending on your zig-wayland version's naming
+                    const output = globals.outputs.swapRemove(i);
+                    std.debug.print("output {} is released\n", .{output.name});
+                    break;
+                }
+            }
+        },
     }
 }
 
@@ -159,5 +193,25 @@ fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSu
             state.configured = true;
         },
         .closed => state.running = false,
+    }
+}
+
+fn outputListener(_: *wl.Output, event: wl.Output.Event, info: *OutputInfo) void {
+    switch (event) {
+        .mode => |mode| {
+            if (mode.flags.current) {
+                info.width = mode.width;
+                info.height = mode.height;
+            }
+        },
+        .scale => |scale_event| {
+            info.scale = scale_event.factor;
+        },
+        .geometry => {},
+        .done => {
+            info.done = true;
+            std.debug.print("Output {} info updated:\n  size={}x{}\n  scale={}\n", .{ info.name, info.height, info.width, info.scale });
+        },
+        else => {},
     }
 }

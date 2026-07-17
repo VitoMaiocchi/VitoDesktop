@@ -15,8 +15,8 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_seat", 4);
     scanner.generate("xdg_wm_base", 3);
     scanner.generate("ext_session_lock_manager_v1", 1);
-    scanner.generate("wl_compositor", 1);
-    scanner.generate("wl_output", 1);
+    scanner.generate("wl_compositor", 4);
+    scanner.generate("wl_output", 4);
     scanner.generate("wl_shm", 1);
 
     scanner.addCustomProtocol(b.path("protocols/wlr-layer-shell-unstable-v1.xml"));
