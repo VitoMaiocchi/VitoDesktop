@@ -34,6 +34,7 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("wayland", wayland);
     exe.root_module.linkSystemLibrary("wayland-client", .{});
+    exe.root_module.linkSystemLibrary("cairo", .{});
 
     b.installArtifact(exe);
 

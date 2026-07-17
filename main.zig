@@ -6,6 +6,10 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zwlr = wayland.client.zwlr;
 
+const cairo = @cImport({
+    @cInclude("cairo/cairo.h");
+});
+
 const Globals = struct {
     shm: ?*wl.Shm,
     compositor: ?*wl.Compositor,
@@ -90,12 +94,31 @@ pub fn main() anyerror!void {
             0,
         );
 
-        for (0..(width * height)) |i| {
-            data[i * 4] = 0x00; //B
-            data[i * 4 + 1] = 0x00; //G
-            data[i * 4 + 2] = 0xFF; //R
-            data[i * 4 + 3] = 0xFF; //A
-        }
+        // Wrap the mmap'd memory as a Cairo surface — no copy, same bytes.
+        const cairo_surface = cairo.cairo_image_surface_create_for_data(
+            data.ptr,
+            cairo.CAIRO_FORMAT_ARGB32,
+            @intCast(width),
+            @intCast(height),
+            @intCast(stride),
+        );
+        defer cairo.cairo_surface_destroy(cairo_surface);
+
+        const cr = cairo.cairo_create(cairo_surface);
+        defer cairo.cairo_destroy(cr);
+
+        // --- draw here ---
+        cairo.cairo_set_source_rgba(cr, 0.11, 0.12, 0.15, 1.0); // background
+        cairo.cairo_paint(cr);
+
+        cairo.cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0); // text color
+        cairo.cairo_select_font_face(cr, "sans-serif", cairo.CAIRO_FONT_SLANT_NORMAL, cairo.CAIRO_FONT_WEIGHT_NORMAL);
+        cairo.cairo_set_font_size(cr, 14.0);
+        cairo.cairo_move_to(cr, 10, 25);
+        cairo.cairo_show_text(cr, "Placeholder Text");
+        // --- end draw ---
+
+        cairo.cairo_surface_flush(cairo_surface); // ensure Cairo's writes are done before Wayland reads the buffer
 
         const pool = try shm.createPool(fd, @intCast(size));
         defer pool.destroy();
