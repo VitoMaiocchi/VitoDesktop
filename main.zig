@@ -4,12 +4,12 @@ const posix = std.posix;
 
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
-const xdg = wayland.client.xdg;
+const zwlr = wayland.client.zwlr;
 
 const Globals = struct {
     shm: ?*wl.Shm,
     compositor: ?*wl.Compositor,
-    wm_base: ?*xdg.WmBase,
+    layer_shell: ?*zwlr.LayerShellV1,
 };
 
 const State = struct {
@@ -27,7 +27,7 @@ pub fn main() anyerror!void {
     var globals = Globals{
         .shm = null,
         .compositor = null,
-        .wm_base = null,
+        .layer_shell = null,
     };
 
     registry.setListener(*Globals, registryListener, &globals);
@@ -37,8 +37,8 @@ pub fn main() anyerror!void {
     defer shm.destroy();
     const compositor = globals.compositor orelse return error.NoWlCompositor;
     defer compositor.destroy();
-    const wm_base = globals.wm_base orelse return error.NoXdgWmBase;
-    defer wm_base.destroy();
+    const layer_shell = globals.layer_shell orelse return error.NoLayerShell;
+    defer layer_shell.destroy();
 
     const buffer = blk: {
         const width = 128;
@@ -67,10 +67,20 @@ pub fn main() anyerror!void {
 
     const surface = try compositor.createSurface();
     defer surface.destroy();
-    const xdg_surface = try wm_base.getXdgSurface(surface);
-    defer xdg_surface.destroy();
-    const xdg_toplevel = try xdg_surface.getToplevel();
-    defer xdg_toplevel.destroy();
+
+    // No xdg_surface/xdg_toplevel — layer shell gives the surface its role directly.
+    // Passing null for output lets the compositor pick (usually the focused one).
+    const layer_surface = try layer_shell.getLayerSurface(
+        surface,
+        null,
+        .top, // layer: background/bottom/top/overlay
+        "hello-zig-wayland",
+    );
+    defer layer_surface.destroy();
+
+    layer_surface.setSize(128, 128);
+    layer_surface.setAnchor(.{ .top = true, .left = true });
+    layer_surface.setExclusiveZone(0); // 0 = don't reserve space; set >0 for a real bar
 
     var state: State = .{
         .surface = surface,
@@ -78,8 +88,7 @@ pub fn main() anyerror!void {
         .running = true,
     };
 
-    xdg_surface.setListener(*State, xdgSurfaceListener, &state);
-    xdg_toplevel.setListener(*State, xdgToplevelListener, &state);
+    layer_surface.setListener(*State, layerSurfaceListener, &state);
 
     surface.commit();
     while (!state.configured) {
@@ -101,27 +110,20 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.compositor = registry.bind(global.name, wl.Compositor, 1) catch return;
             } else if (mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
                 globals.shm = registry.bind(global.name, wl.Shm, 1) catch return;
-            } else if (mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
-                globals.wm_base = registry.bind(global.name, xdg.WmBase, 1) catch return;
+            } else if (mem.orderZ(u8, global.interface, zwlr.LayerShellV1.interface.name) == .eq) {
+                globals.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, 1) catch return;
             }
         },
         .global_remove => {},
     }
 }
 
-fn xdgSurfaceListener(xdg_surface: *xdg.Surface, event: xdg.Surface.Event, state: *State) void {
+fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, state: *State) void {
     switch (event) {
         .configure => |configure| {
-            xdg_surface.ackConfigure(configure.serial);
-            state.surface.commit();
+            layer_surface.ackConfigure(configure.serial);
             state.configured = true;
         },
-    }
-}
-
-fn xdgToplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, state: *State) void {
-    switch (event) {
-        .configure => {},
-        .close => state.running = false,
+        .closed => state.running = false,
     }
 }
