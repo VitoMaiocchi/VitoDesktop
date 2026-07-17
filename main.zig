@@ -20,8 +20,6 @@ const State = struct {
     height: u32 = 0,
 };
 
-const scaling = 2; //PLACEHOLDER
-
 pub fn main() anyerror!void {
     const display = try wl.Display.connect(null);
     defer display.disconnect();
@@ -58,8 +56,8 @@ pub fn main() anyerror!void {
     defer layer_surface.destroy();
 
     layer_surface.setAnchor(.{ .top = true, .left = true, .right = true });
-    layer_surface.setSize(0, 40);
-    layer_surface.setExclusiveZone(10); // 0 = don't reserve space; set >0 for a real bar
+    layer_surface.setSize(0, 30);
+    layer_surface.setExclusiveZone(30); // 0 = don't reserve space; set >0 for a real bar
 
     var state: State = .{
         .surface = surface,
