@@ -16,7 +16,11 @@ const State = struct {
     surface: *wl.Surface,
     configured: bool,
     running: bool,
+    width: u32 = 0,
+    height: u32 = 0,
 };
+
+const scaling = 2; //PLACEHOLDER
 
 pub fn main() anyerror!void {
     const display = try wl.Display.connect(null);
@@ -40,37 +44,6 @@ pub fn main() anyerror!void {
     const layer_shell = globals.layer_shell orelse return error.NoLayerShell;
     defer layer_shell.destroy();
 
-    const buffer = blk: {
-        const width = 128;
-        const height = 128;
-        const stride = width * 4;
-        const size = stride * height;
-
-        const fd = try posix.memfd_create("hello-zig-wayland", 0);
-        if (posix.errno(posix.system.ftruncate(fd, size)) != .SUCCESS) return error.FtruncateFailed;
-        const data = try posix.mmap(
-            null,
-            size,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED },
-            fd,
-            0,
-        );
-
-        for (0..(width * height)) |i| {
-            data[i * 4] = 0x00; //B
-            data[i * 4 + 1] = 0x00; //G
-            data[i * 4 + 2] = 0xFF; //R
-            data[i * 4 + 3] = 0xFF; //A
-        }
-
-        const pool = try shm.createPool(fd, size);
-        defer pool.destroy();
-
-        break :blk try pool.createBuffer(0, width, height, stride, wl.Shm.Format.argb8888);
-    };
-    defer buffer.destroy();
-
     const surface = try compositor.createSurface();
     defer surface.destroy();
 
@@ -84,9 +57,9 @@ pub fn main() anyerror!void {
     );
     defer layer_surface.destroy();
 
-    layer_surface.setSize(128, 128);
-    layer_surface.setAnchor(.{ .top = true, .left = true });
-    layer_surface.setExclusiveZone(0); // 0 = don't reserve space; set >0 for a real bar
+    layer_surface.setAnchor(.{ .top = true, .left = true, .right = true });
+    layer_surface.setSize(0, 40);
+    layer_surface.setExclusiveZone(10); // 0 = don't reserve space; set >0 for a real bar
 
     var state: State = .{
         .surface = surface,
@@ -100,6 +73,38 @@ pub fn main() anyerror!void {
     while (!state.configured) {
         if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
     }
+
+    const buffer = blk: {
+        std.debug.print("state size: {}, {}", .{ state.width, state.height });
+        const width = state.width;
+        const height = state.height;
+        const stride = width * 4;
+        const size = stride * height;
+
+        const fd = try posix.memfd_create("hello-zig-wayland", 0);
+        if (posix.errno(posix.system.ftruncate(fd, @intCast(size))) != .SUCCESS) return error.FtruncateFailed;
+        const data = try posix.mmap(
+            null,
+            @intCast(size),
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+
+        for (0..(width * height)) |i| {
+            data[i * 4] = 0x00; //B
+            data[i * 4 + 1] = 0x00; //G
+            data[i * 4 + 2] = 0xFF; //R
+            data[i * 4 + 3] = 0xFF; //A
+        }
+
+        const pool = try shm.createPool(fd, @intCast(size));
+        defer pool.destroy();
+
+        break :blk try pool.createBuffer(0, @intCast(width), @intCast(height), @intCast(stride), wl.Shm.Format.argb8888);
+    };
+    defer buffer.destroy();
 
     surface.attach(buffer, 0, 0);
     surface.commit();
@@ -127,6 +132,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
 fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, state: *State) void {
     switch (event) {
         .configure => |configure| {
+            state.width = configure.width;
+            state.height = configure.height;
             layer_surface.ackConfigure(configure.serial);
             state.configured = true;
         },
