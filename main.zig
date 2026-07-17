@@ -113,31 +113,7 @@ pub fn main() anyerror!void {
             0,
         );
 
-        // Wrap the mmap'd memory as a Cairo surface — no copy, same bytes.
-        const cairo_surface = cairo.cairo_image_surface_create_for_data(
-            data.ptr,
-            cairo.CAIRO_FORMAT_ARGB32,
-            @intCast(width),
-            @intCast(height),
-            @intCast(stride),
-        );
-        defer cairo.cairo_surface_destroy(cairo_surface);
-
-        const cr = cairo.cairo_create(cairo_surface);
-        defer cairo.cairo_destroy(cr);
-
-        // --- draw here ---
-        cairo.cairo_set_source_rgba(cr, 0.11, 0.12, 0.15, 1.0); // background
-        cairo.cairo_paint(cr);
-
-        cairo.cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0); // text color
-        cairo.cairo_select_font_face(cr, "sans-serif", cairo.CAIRO_FONT_SLANT_NORMAL, cairo.CAIRO_FONT_WEIGHT_NORMAL);
-        cairo.cairo_set_font_size(cr, 14.0);
-        cairo.cairo_move_to(cr, 10, 25);
-        cairo.cairo_show_text(cr, "Placeholder Text");
-        // --- end draw ---
-
-        cairo.cairo_surface_flush(cairo_surface); // ensure Cairo's writes are done before Wayland reads the buffer
+        drawTitlebar(data.ptr, cairo.CAIRO_FORMAT_ARGB32, @intCast(width), @intCast(height), @intCast(stride));
 
         const pool = try shm.createPool(fd, @intCast(size));
         defer pool.destroy();
@@ -214,4 +190,32 @@ fn outputListener(_: *wl.Output, event: wl.Output.Event, info: *OutputInfo) void
         },
         else => {},
     }
+}
+
+fn drawTitlebar(data: [*c]u8, format: cairo.cairo_format_t, width: c_int, height: c_int, stride: c_int) void {
+    // Wrap the mmap'd memory as a Cairo surface — no copy, same bytes.
+    const cairo_surface = cairo.cairo_image_surface_create_for_data(
+        data,
+        format,
+        width,
+        height,
+        stride,
+    );
+    defer cairo.cairo_surface_destroy(cairo_surface);
+
+    const cr = cairo.cairo_create(cairo_surface);
+    defer cairo.cairo_destroy(cr);
+
+    // --- draw here ---
+    cairo.cairo_set_source_rgba(cr, 0.11, 0.12, 0.15, 1.0); // background
+    cairo.cairo_paint(cr);
+
+    cairo.cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0); // text color
+    cairo.cairo_select_font_face(cr, "sans-serif", cairo.CAIRO_FONT_SLANT_NORMAL, cairo.CAIRO_FONT_WEIGHT_NORMAL);
+    cairo.cairo_set_font_size(cr, 14.0);
+    cairo.cairo_move_to(cr, 10, 25);
+    cairo.cairo_show_text(cr, "Placeholder Text");
+    // --- end draw ---
+
+    cairo.cairo_surface_flush(cairo_surface); // ensure Cairo's writes are done before Wayland reads the buffer
 }
