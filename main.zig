@@ -56,7 +56,13 @@ pub fn main() anyerror!void {
             fd,
             0,
         );
-        @memcpy(data, @embedFile("cat.bgra"));
+
+        for (0..(width * height)) |i| {
+            data[i * 4] = 0x00; //B
+            data[i * 4 + 1] = 0x00; //G
+            data[i * 4 + 2] = 0xFF; //R
+            data[i * 4 + 3] = 0xFF; //A
+        }
 
         const pool = try shm.createPool(fd, size);
         defer pool.destroy();
