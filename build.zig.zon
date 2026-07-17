@@ -1,0 +1,12 @@
+.{
+    .name = .HyperBar,
+    .version = "0.16.0",
+    .dependencies = .{
+        .wayland = .{
+            .url = "git+https://github.com/ifreund/zig-wayland#23839e41161de025d71ce082561ecba1c5331281",
+            .hash = "wayland-0.7.0-dev-lQa1kl38AQC-kQolS5D4jV1GJ2rH2jv1VWHr14YLVnyn",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0xcc9f1d7a3da1ab7c,
+}
