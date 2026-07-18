@@ -17,6 +17,7 @@ const OutputInfo = struct {
     height: i32 = 0,
     scale: i32 = 1,
     done: bool = false, // set once compositor signals this output's info is complete
+    titlebar: *TitlebarSurface,
 };
 
 const Globals = struct {
@@ -28,8 +29,6 @@ const Globals = struct {
 };
 
 const State = struct {
-    surface: *wl.Surface,
-    configured: bool,
     running: bool,
     width: u32 = 0,
     height: u32 = 0,
@@ -66,66 +65,7 @@ pub fn main() anyerror!void {
     const layer_shell = globals.layer_shell orelse return error.NoLayerShell;
     defer layer_shell.destroy();
 
-    const surface = try compositor.createSurface();
-    defer surface.destroy();
-
-    // No xdg_surface/xdg_toplevel — layer shell gives the surface its role directly.
-    // Passing null for output lets the compositor pick (usually the focused one).
-    const layer_surface = try layer_shell.getLayerSurface(
-        surface,
-        null,
-        .top, // layer: background/bottom/top/overlay
-        "hello-zig-wayland",
-    );
-    defer layer_surface.destroy();
-
-    layer_surface.setAnchor(.{ .top = true, .left = true, .right = true });
-    layer_surface.setSize(0, 30);
-    layer_surface.setExclusiveZone(30); // 0 = don't reserve space; set >0 for a real bar
-
-    var state: State = .{
-        .surface = surface,
-        .configured = false,
-        .running = true,
-    };
-
-    layer_surface.setListener(*State, layerSurfaceListener, &state);
-
-    surface.commit();
-    while (!state.configured) {
-        if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
-    }
-
-    const buffer = blk: {
-        const width = state.width;
-        const height = state.height;
-        const stride = width * 4;
-        const size = stride * height;
-
-        const fd = try posix.memfd_create("hello-zig-wayland", 0);
-        if (posix.errno(posix.system.ftruncate(fd, @intCast(size))) != .SUCCESS) return error.FtruncateFailed;
-        const data = try posix.mmap(
-            null,
-            @intCast(size),
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED },
-            fd,
-            0,
-        );
-
-        drawTitlebar(data.ptr, cairo.CAIRO_FORMAT_ARGB32, @intCast(width), @intCast(height), @intCast(stride));
-
-        const pool = try shm.createPool(fd, @intCast(size));
-        defer pool.destroy();
-
-        break :blk try pool.createBuffer(0, @intCast(width), @intCast(height), @intCast(stride), wl.Shm.Format.argb8888);
-    };
-    defer buffer.destroy();
-
-    surface.attach(buffer, 0, 0);
-    surface.commit();
-
-    while (state.running) {
+    while (true) {
         if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
     }
 }
@@ -141,8 +81,11 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, 1) catch return;
             } else if (mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
                 const output = registry.bind(global.name, wl.Output, 4) catch return; // v2+ for scale event
-                globals.outputs.append(globals.allocator, .{ .output = output, .name = global.name }) catch return;
+                const titlebar = globals.allocator.create(TitlebarSurface) catch return;
+                titlebar.globals = globals;
+                globals.outputs.append(globals.allocator, .{ .output = output, .name = global.name, .titlebar = titlebar }) catch return;
                 const info = &globals.outputs.items[globals.outputs.items.len - 1];
+                info.titlebar.create() catch std.debug.print("error", .{});
                 output.setListener(*OutputInfo, outputListener, info);
                 std.debug.print("output {} has been created\n", .{info.name});
             }
@@ -157,18 +100,6 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 }
             }
         },
-    }
-}
-
-fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, state: *State) void {
-    switch (event) {
-        .configure => |configure| {
-            state.width = configure.width;
-            state.height = configure.height;
-            layer_surface.ackConfigure(configure.serial);
-            state.configured = true;
-        },
-        .closed => state.running = false,
     }
 }
 
@@ -191,6 +122,84 @@ fn outputListener(_: *wl.Output, event: wl.Output.Event, info: *OutputInfo) void
         else => {},
     }
 }
+
+//FIXME: atrocious error handling (ignoring)
+const TitlebarSurface = struct {
+    globals: *Globals,
+    surface: ?*wl.Surface = null,
+    layer_surface: ?*zwlr.LayerSurfaceV1 = null,
+    width: u32 = 0,
+    height: u32 = 0,
+
+    pub fn create(self: *TitlebarSurface) !void {
+        //const shm = self.globals.shm orelse return error.NoWlShm;
+        const compositor = self.globals.compositor orelse return error.NoWlCompositor;
+        const layer_shell = self.globals.layer_shell orelse return error.NoLayerShell;
+        self.surface = try compositor.createSurface();
+
+        self.layer_surface = try layer_shell.getLayerSurface(
+            self.surface.?,
+            null,
+            .top, // layer: background/bottom/top/overlay
+            "hello-zig-wayland",
+        );
+
+        self.layer_surface.?.setAnchor(.{ .top = true, .left = true, .right = true });
+        self.layer_surface.?.setSize(0, 30);
+        self.layer_surface.?.setExclusiveZone(30); // 0 = don't reserve space; set >0 for a real bar
+
+        self.layer_surface.?.setListener(*TitlebarSurface, layerSurfaceListener, self);
+
+        self.surface.?.commit();
+    }
+
+    pub fn destroy(self: *TitlebarSurface) void {
+        self.layer_surface.destroy();
+        self.surface.destroy();
+    }
+
+    fn layerSurfaceListener(_: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, self: *TitlebarSurface) void {
+        switch (event) {
+            .configure => |configure| {
+                const shm = self.globals.shm orelse return;
+
+                self.width = configure.width;
+                self.height = configure.height;
+                self.layer_surface.?.ackConfigure(configure.serial);
+
+                const buffer = blk: {
+                    const stride = self.width * 4;
+                    const size = stride * self.height;
+
+                    const fd = posix.memfd_create("hello-zig-wayland", 0) catch return;
+                    if (posix.errno(posix.system.ftruncate(fd, @intCast(size))) != .SUCCESS) {
+                        std.debug.print("layer surface listener truncate failed", .{});
+                    }
+                    const data = posix.mmap(
+                        null,
+                        @intCast(size),
+                        .{ .READ = true, .WRITE = true },
+                        .{ .TYPE = .SHARED },
+                        fd,
+                        0,
+                    ) catch return;
+
+                    drawTitlebar(data.ptr, cairo.CAIRO_FORMAT_ARGB32, @intCast(self.width), @intCast(self.height), @intCast(stride));
+
+                    const pool = shm.createPool(fd, @intCast(size)) catch return;
+                    defer pool.destroy();
+
+                    break :blk pool.createBuffer(0, @intCast(self.width), @intCast(self.height), @intCast(stride), wl.Shm.Format.argb8888) catch return;
+                };
+                defer buffer.destroy();
+
+                self.surface.?.attach(buffer, 0, 0);
+                self.surface.?.commit();
+            },
+            .closed => {},
+        }
+    }
+};
 
 fn drawTitlebar(data: [*c]u8, format: cairo.cairo_format_t, width: c_int, height: c_int, stride: c_int) void {
     // Wrap the mmap'd memory as a Cairo surface — no copy, same bytes.
