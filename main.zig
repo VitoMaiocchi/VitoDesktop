@@ -119,6 +119,7 @@ fn outputListener(_: *wl.Output, event: wl.Output.Event, info: *OutputInfo) void
         .done => {
             info.done = true;
             std.debug.print("Output {} info updated:\n  size={}x{}\n  scale={}\n", .{ info.name, info.height, info.width, info.scale });
+            info.titlebar.commit(info.scale);
         },
         else => {},
     }
@@ -131,6 +132,7 @@ const TitlebarSurface = struct {
     layer_surface: ?*zwlr.LayerSurfaceV1 = null,
     width: u32 = 0,
     height: u32 = 0,
+    scale: u32 = 1,
 
     pub fn create(self: *TitlebarSurface, output: *wl.Output) !void {
         //const shm = self.globals.shm orelse return error.NoWlShm;
@@ -150,7 +152,11 @@ const TitlebarSurface = struct {
         self.layer_surface.?.setExclusiveZone(30); // 0 = don't reserve space; set >0 for a real bar
 
         self.layer_surface.?.setListener(*TitlebarSurface, layerSurfaceListener, self);
+    }
 
+    pub fn commit(self: *TitlebarSurface, scale: i32) void {
+        self.scale = @intCast(scale);
+        self.surface.?.setBufferScale(scale);
         self.surface.?.commit();
     }
 
@@ -164,8 +170,8 @@ const TitlebarSurface = struct {
             .configure => |configure| {
                 const shm = self.globals.shm orelse return;
 
-                self.width = configure.width;
-                self.height = configure.height;
+                self.width = configure.width * self.scale;
+                self.height = configure.height * self.scale;
                 self.layer_surface.?.ackConfigure(configure.serial);
 
                 const buffer = blk: {
@@ -185,7 +191,7 @@ const TitlebarSurface = struct {
                         0,
                     ) catch return;
 
-                    drawTitlebar(data.ptr, cairo.CAIRO_FORMAT_ARGB32, @intCast(self.width), @intCast(self.height), @intCast(stride));
+                    drawTitlebar(data.ptr, cairo.CAIRO_FORMAT_ARGB32, @intCast(self.width), @intCast(self.height), @intCast(stride), self.scale);
 
                     const pool = shm.createPool(fd, @intCast(size)) catch return;
                     defer pool.destroy();
@@ -202,7 +208,8 @@ const TitlebarSurface = struct {
     }
 };
 
-fn drawTitlebar(data: [*c]u8, format: cairo.cairo_format_t, width: c_int, height: c_int, stride: c_int) void {
+fn drawTitlebar(data: [*c]u8, format: cairo.cairo_format_t, width: c_int, height: c_int, stride: c_int, scale: u32) void {
+    const s: f64 = @floatFromInt(scale);
     // Wrap the mmap'd memory as a Cairo surface — no copy, same bytes.
     const cairo_surface = cairo.cairo_image_surface_create_for_data(
         data,
@@ -222,8 +229,8 @@ fn drawTitlebar(data: [*c]u8, format: cairo.cairo_format_t, width: c_int, height
 
     cairo.cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0); // text color
     cairo.cairo_select_font_face(cr, "sans-serif", cairo.CAIRO_FONT_SLANT_NORMAL, cairo.CAIRO_FONT_WEIGHT_NORMAL);
-    cairo.cairo_set_font_size(cr, 14.0);
-    cairo.cairo_move_to(cr, 10, 25);
+    cairo.cairo_set_font_size(cr, s * 14.0);
+    cairo.cairo_move_to(cr, 10 * s, 25 * s);
     cairo.cairo_show_text(cr, "Placeholder Text");
     // --- end draw ---
 
