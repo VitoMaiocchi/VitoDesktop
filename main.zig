@@ -85,7 +85,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 titlebar.globals = globals;
                 globals.outputs.append(globals.allocator, .{ .output = output, .name = global.name, .titlebar = titlebar }) catch return;
                 const info = &globals.outputs.items[globals.outputs.items.len - 1];
-                info.titlebar.create() catch std.debug.print("error", .{});
+                info.titlebar.create(info.output) catch std.debug.print("error", .{});
                 output.setListener(*OutputInfo, outputListener, info);
                 std.debug.print("output {} has been created\n", .{info.name});
             }
@@ -95,6 +95,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 if (o.name == remove.name) {
                     o.output.release(); // or .destroy() depending on your zig-wayland version's naming
                     const output = globals.outputs.swapRemove(i);
+                    output.titlebar.destroy();
                     std.debug.print("output {} is released\n", .{output.name});
                     break;
                 }
@@ -131,7 +132,7 @@ const TitlebarSurface = struct {
     width: u32 = 0,
     height: u32 = 0,
 
-    pub fn create(self: *TitlebarSurface) !void {
+    pub fn create(self: *TitlebarSurface, output: *wl.Output) !void {
         //const shm = self.globals.shm orelse return error.NoWlShm;
         const compositor = self.globals.compositor orelse return error.NoWlCompositor;
         const layer_shell = self.globals.layer_shell orelse return error.NoLayerShell;
@@ -139,7 +140,7 @@ const TitlebarSurface = struct {
 
         self.layer_surface = try layer_shell.getLayerSurface(
             self.surface.?,
-            null,
+            output,
             .top, // layer: background/bottom/top/overlay
             "hello-zig-wayland",
         );
@@ -154,8 +155,8 @@ const TitlebarSurface = struct {
     }
 
     pub fn destroy(self: *TitlebarSurface) void {
-        self.layer_surface.destroy();
-        self.surface.destroy();
+        self.layer_surface.?.destroy();
+        self.surface.?.destroy();
     }
 
     fn layerSurfaceListener(_: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, self: *TitlebarSurface) void {
