@@ -34,6 +34,15 @@ const State = struct {
     height: u32 = 0,
 };
 
+const DrawableSurface = struct {
+    data: [*c]u8,
+    format: cairo.cairo_format_t,
+    width: c_int,
+    height: c_int,
+    stride: c_int,
+    scale: u32,
+};
+
 pub fn main() anyerror!void {
     const display = try wl.Display.connect(null);
     defer display.disconnect();
@@ -191,7 +200,15 @@ const TitlebarSurface = struct {
                         0,
                     ) catch return;
 
-                    drawTitlebar(data.ptr, cairo.CAIRO_FORMAT_ARGB32, @intCast(self.width), @intCast(self.height), @intCast(stride), self.scale);
+                    const s = DrawableSurface{
+                        .data = data.ptr,
+                        .format = cairo.CAIRO_FORMAT_ARGB32,
+                        .width = @intCast(self.width),
+                        .height = @intCast(self.height),
+                        .stride = @intCast(stride),
+                        .scale = self.scale,
+                    };
+                    drawTitlebar(s);
 
                     const pool = shm.createPool(fd, @intCast(size)) catch return;
                     defer pool.destroy();
@@ -208,15 +225,15 @@ const TitlebarSurface = struct {
     }
 };
 
-fn drawTitlebar(data: [*c]u8, format: cairo.cairo_format_t, width: c_int, height: c_int, stride: c_int, scale: u32) void {
-    const s: f64 = @floatFromInt(scale);
+fn drawTitlebar(surface: DrawableSurface) void {
+    const s: f64 = @floatFromInt(surface.scale);
     // Wrap the mmap'd memory as a Cairo surface — no copy, same bytes.
     const cairo_surface = cairo.cairo_image_surface_create_for_data(
-        data,
-        format,
-        width,
-        height,
-        stride,
+        surface.data,
+        surface.format,
+        surface.width,
+        surface.height,
+        surface.stride,
     );
     defer cairo.cairo_surface_destroy(cairo_surface);
 
