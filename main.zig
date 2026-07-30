@@ -10,7 +10,7 @@ const cairo = @cImport({
     @cInclude("cairo/cairo.h");
 });
 
-const OutputInfo = struct {
+const Output = struct {
     output: *wl.Output,
     name: u32, // the wl_registry global name, useful as a stable key
     width: i32 = 0,
@@ -24,14 +24,8 @@ const Globals = struct {
     shm: ?*wl.Shm,
     compositor: ?*wl.Compositor,
     layer_shell: ?*zwlr.LayerShellV1,
-    outputs: std.ArrayList(OutputInfo),
+    outputs: std.ArrayList(Output),
     allocator: std.mem.Allocator,
-};
-
-const State = struct {
-    running: bool,
-    width: u32 = 0,
-    height: u32 = 0,
 };
 
 const DrawableSurface = struct {
@@ -49,19 +43,12 @@ pub fn main() anyerror!void {
     const registry = try display.getRegistry();
     defer registry.destroy();
 
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer {
-        const leaked = gpa.deinit();
-        if (leaked == .leak) std.debug.print("memory leak detected\n", .{});
-    }
-    const allocator = gpa.allocator();
-
     var globals = Globals{
         .shm = null,
         .compositor = null,
         .layer_shell = null,
-        .outputs = std.ArrayList(OutputInfo).empty,
-        .allocator = allocator,
+        .outputs = std.ArrayList(Output).empty,
+        .allocator = std.heap.page_allocator,
     };
 
     registry.setListener(*Globals, registryListener, &globals);
@@ -89,20 +76,29 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
             } else if (mem.orderZ(u8, global.interface, zwlr.LayerShellV1.interface.name) == .eq) {
                 globals.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, 1) catch return;
             } else if (mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
-                const output = registry.bind(global.name, wl.Output, 4) catch return; // v2+ for scale event
-                const titlebar = globals.allocator.create(TitlebarSurface) catch return;
+                const wlOutput = registry.bind(global.name, wl.Output, 4) catch {
+                    std.debug.print("ERROR: failed to bind output", .{});
+                    return;
+                };
+                const titlebar = globals.allocator.create(TitlebarSurface) catch {
+                    std.debug.print("ERROR: failed to create TitlebarSurface", .{});
+                    return;
+                };
                 titlebar.globals = globals;
-                globals.outputs.append(globals.allocator, .{ .output = output, .name = global.name, .titlebar = titlebar }) catch return;
-                const info = &globals.outputs.items[globals.outputs.items.len - 1];
-                info.titlebar.create(info.output) catch std.debug.print("error", .{});
-                output.setListener(*OutputInfo, outputListener, info);
-                std.debug.print("output {} has been created\n", .{info.name});
+                globals.outputs.append(globals.allocator, .{ .output = wlOutput, .name = global.name, .titlebar = titlebar }) catch {
+                    std.debug.print("ERROR: failed to add output to list", .{});
+                    return;
+                };
+                const output = &globals.outputs.items[globals.outputs.items.len - 1];
+                output.titlebar.create(output.output);
+                wlOutput.setListener(*Output, outputListener, output);
+                std.debug.print("output {} has been created\n", .{output.name});
             }
         },
         .global_remove => |remove| {
             for (globals.outputs.items, 0..) |o, i| {
                 if (o.name == remove.name) {
-                    o.output.release(); // or .destroy() depending on your zig-wayland version's naming
+                    o.output.release();
                     const output = globals.outputs.swapRemove(i);
                     output.titlebar.destroy();
                     std.debug.print("output {} is released\n", .{output.name});
@@ -113,7 +109,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
     }
 }
 
-fn outputListener(_: *wl.Output, event: wl.Output.Event, info: *OutputInfo) void {
+fn outputListener(_: *wl.Output, event: wl.Output.Event, info: *Output) void {
     switch (event) {
         .mode => |mode| {
             if (mode.flags.current) {
@@ -134,7 +130,6 @@ fn outputListener(_: *wl.Output, event: wl.Output.Event, info: *OutputInfo) void
     }
 }
 
-//FIXME: atrocious error handling (ignoring)
 const TitlebarSurface = struct {
     globals: *Globals,
     surface: ?*wl.Surface = null,
@@ -143,18 +138,23 @@ const TitlebarSurface = struct {
     height: u32 = 0,
     scale: u32 = 1,
 
-    pub fn create(self: *TitlebarSurface, output: *wl.Output) !void {
-        //const shm = self.globals.shm orelse return error.NoWlShm;
-        const compositor = self.globals.compositor orelse return error.NoWlCompositor;
-        const layer_shell = self.globals.layer_shell orelse return error.NoLayerShell;
-        self.surface = try compositor.createSurface();
+    pub fn create(self: *TitlebarSurface, output: *wl.Output) void {
+        const compositor = self.globals.compositor orelse return;
+        const layer_shell = self.globals.layer_shell orelse return;
+        self.surface = compositor.createSurface() catch {
+            std.debug.print("ERROR: failed to create titlebar surface", .{});
+            return;
+        };
 
-        self.layer_surface = try layer_shell.getLayerSurface(
+        self.layer_surface = layer_shell.getLayerSurface(
             self.surface.?,
             output,
             .top, // layer: background/bottom/top/overlay
             "hello-zig-wayland",
-        );
+        ) catch {
+            std.debug.print("ERROR: failed to get titlebar layer surface", .{});
+            return;
+        };
 
         self.layer_surface.?.setAnchor(.{ .top = true, .left = true, .right = true });
         self.layer_surface.?.setSize(0, 30);
@@ -187,7 +187,10 @@ const TitlebarSurface = struct {
                     const stride = self.width * 4;
                     const size = stride * self.height;
 
-                    const fd = posix.memfd_create("hello-zig-wayland", 0) catch return;
+                    const fd = posix.memfd_create("hello-zig-wayland", 0) catch {
+                        std.debug.print("ERROR: titlebar memfd create failed", .{});
+                        return;
+                    };
                     if (posix.errno(posix.system.ftruncate(fd, @intCast(size))) != .SUCCESS) {
                         std.debug.print("layer surface listener truncate failed", .{});
                     }
@@ -198,7 +201,10 @@ const TitlebarSurface = struct {
                         .{ .TYPE = .SHARED },
                         fd,
                         0,
-                    ) catch return;
+                    ) catch {
+                        std.debug.print("ERROR: titlebar memory map failed", .{});
+                        return;
+                    };
 
                     const s = DrawableSurface{
                         .data = data.ptr,
@@ -210,10 +216,16 @@ const TitlebarSurface = struct {
                     };
                     drawTitlebar(s);
 
-                    const pool = shm.createPool(fd, @intCast(size)) catch return;
+                    const pool = shm.createPool(fd, @intCast(size)) catch {
+                        std.debug.print("ERROR: titlebar create shm pool failed", .{});
+                        return;
+                    };
                     defer pool.destroy();
 
-                    break :blk pool.createBuffer(0, @intCast(self.width), @intCast(self.height), @intCast(stride), wl.Shm.Format.argb8888) catch return;
+                    break :blk pool.createBuffer(0, @intCast(self.width), @intCast(self.height), @intCast(stride), wl.Shm.Format.argb8888) catch {
+                        std.debug.print("ERROR: titlebar create buffer failed", .{});
+                        return;
+                    };
                 };
                 defer buffer.destroy();
 
