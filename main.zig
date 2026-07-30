@@ -1,6 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
 const posix = std.posix;
+const linux = std.os.linux;
 
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
@@ -61,16 +62,32 @@ pub fn main() anyerror!void {
     const layer_shell = globals.layer_shell orelse return error.NoLayerShell;
     defer layer_shell.destroy();
 
-    const fd = display.getFd();
+    const wlFd: i32 = display.getFd();
+    const timerFd: i32 = @intCast(linux.timerfd_create(linux.timerfd_clockid_t.MONOTONIC, .{}));
+
+    var spec = linux.itimerspec{
+        .it_interval = .{
+            .sec = 0,
+            .nsec = 500_000_000, // 0.5 s
+        },
+        .it_value = .{
+            .sec = 0,
+            .nsec = 500_000_000, // first expiration after 0.5 s
+        },
+    };
+
+    _ = linux.timerfd_settime(timerFd, .{}, &spec, null);
 
     while (true) {
-        var fds = [_]std.posix.pollfd{
-            .{
-                .fd = fd,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            },
-        };
+        var fds = [_]std.posix.pollfd{ .{
+            .fd = wlFd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }, .{
+            .fd = timerFd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        } };
 
         if (!display.prepareRead()) {
             _ = display.dispatchPending();
@@ -81,6 +98,7 @@ pub fn main() anyerror!void {
 
         _ = try std.posix.poll(&fds, -1);
         const wayland_fd_ready = (fds[0].revents & std.posix.POLL.IN) != 0;
+        const timer_fd_ready = (fds[1].revents & std.posix.POLL.IN) != 0;
 
         if (wayland_fd_ready) {
             if (display.readEvents() != .SUCCESS)
@@ -90,6 +108,16 @@ pub fn main() anyerror!void {
         }
 
         _ = display.dispatchPending();
+
+        if (timer_fd_ready) {
+            var expirations: u64 = undefined;
+            _ = linux.read(
+                timerFd,
+                std.mem.asBytes(&expirations).ptr,
+                @sizeOf(u64),
+            );
+            std.debug.print("timer expirations={}\n", .{expirations});
+        }
     }
 }
 
