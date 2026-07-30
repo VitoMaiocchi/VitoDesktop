@@ -61,8 +61,35 @@ pub fn main() anyerror!void {
     const layer_shell = globals.layer_shell orelse return error.NoLayerShell;
     defer layer_shell.destroy();
 
+    const fd = display.getFd();
+
     while (true) {
-        if (display.dispatch() != .SUCCESS) return error.DispatchFailed;
+        var fds = [_]std.posix.pollfd{
+            .{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+
+        if (!display.prepareRead()) {
+            _ = display.dispatchPending();
+            continue;
+        }
+
+        _ = display.flush();
+
+        _ = try std.posix.poll(&fds, -1);
+        const wayland_fd_ready = (fds[0].revents & std.posix.POLL.IN) != 0;
+
+        if (wayland_fd_ready) {
+            if (display.readEvents() != .SUCCESS)
+                return error.ReadFailed;
+        } else {
+            display.cancelRead();
+        }
+
+        _ = display.dispatchPending();
     }
 }
 
