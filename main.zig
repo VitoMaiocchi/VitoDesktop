@@ -11,6 +11,10 @@ const cairo = @cImport({
     @cInclude("cairo/cairo.h");
 });
 
+const time = @cImport({
+    @cInclude("time.h");
+});
+
 const Output = struct {
     output: *wl.Output,
     name: u32, // the wl_registry global name, useful as a stable key
@@ -27,6 +31,7 @@ const Globals = struct {
     layer_shell: ?*zwlr.LayerShellV1,
     outputs: std.ArrayList(Output),
     allocator: std.mem.Allocator,
+    titlebarState: TitlebarState,
 };
 
 const DrawableSurface = struct {
@@ -38,11 +43,19 @@ const DrawableSurface = struct {
     scale: u32,
 };
 
+const TitlebarState = struct {
+    currentTime: time.struct_tm,
+};
+
 pub fn main() anyerror!void {
     const display = try wl.Display.connect(null);
     defer display.disconnect();
     const registry = try display.getRegistry();
     defer registry.destroy();
+
+    var now: time.time_t = time.time(null);
+    var tm: time.struct_tm = undefined;
+    _ = time.localtime_r(&now, &tm);
 
     var globals = Globals{
         .shm = null,
@@ -50,6 +63,7 @@ pub fn main() anyerror!void {
         .layer_shell = null,
         .outputs = std.ArrayList(Output).empty,
         .allocator = std.heap.page_allocator,
+        .titlebarState = TitlebarState{ .currentTime = tm },
     };
 
     registry.setListener(*Globals, registryListener, &globals);
@@ -67,12 +81,12 @@ pub fn main() anyerror!void {
 
     var spec = linux.itimerspec{
         .it_interval = .{
-            .sec = 0,
-            .nsec = 500_000_000, // 0.5 s
+            .sec = 1,
+            .nsec = 0, // 0.5 s
         },
         .it_value = .{
-            .sec = 0,
-            .nsec = 500_000_000, // first expiration after 0.5 s
+            .sec = 1,
+            .nsec = 0, // first expiration after 0.5 s
         },
     };
 
@@ -117,6 +131,9 @@ pub fn main() anyerror!void {
                 @sizeOf(u64),
             );
             std.debug.print("timer expirations={}\n", .{expirations});
+            now = time.time(null);
+            _ = time.localtime_r(&now, &globals.titlebarState.currentTime);
+            //updateTitlebarState(globals);
         }
     }
 }
@@ -269,7 +286,7 @@ const TitlebarSurface = struct {
                         .stride = @intCast(stride),
                         .scale = self.scale,
                     };
-                    drawTitlebar(s);
+                    drawTitlebar(&s, &self.globals.titlebarState);
 
                     const pool = shm.createPool(fd, @intCast(size)) catch {
                         std.debug.print("ERROR: titlebar create shm pool failed", .{});
@@ -292,8 +309,18 @@ const TitlebarSurface = struct {
     }
 };
 
-fn drawTitlebar(surface: DrawableSurface) void {
+fn drawTitlebar(surface: *const DrawableSurface, state: *const TitlebarState) void {
     const s: f64 = @floatFromInt(surface.scale);
+
+    var buf: [32]u8 = undefined;
+    const len = time.strftime(
+        &buf[0],
+        buf.len,
+        "%H:%M:%S %d.%m.%Y",
+        &state.currentTime,
+    );
+    const timeStr = buf[0..len];
+
     // Wrap the mmap'd memory as a Cairo surface — no copy, same bytes.
     const cairo_surface = cairo.cairo_image_surface_create_for_data(
         surface.data,
@@ -315,7 +342,7 @@ fn drawTitlebar(surface: DrawableSurface) void {
     cairo.cairo_select_font_face(cr, "sans-serif", cairo.CAIRO_FONT_SLANT_NORMAL, cairo.CAIRO_FONT_WEIGHT_NORMAL);
     cairo.cairo_set_font_size(cr, s * 14.0);
     cairo.cairo_move_to(cr, 10 * s, 25 * s);
-    cairo.cairo_show_text(cr, "Placeholder Text");
+    cairo.cairo_show_text(cr, &timeStr[0]);
     // --- end draw ---
 
     cairo.cairo_surface_flush(cairo_surface); // ensure Cairo's writes are done before Wayland reads the buffer
