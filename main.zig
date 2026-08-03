@@ -130,11 +130,16 @@ pub fn main() anyerror!void {
                 std.mem.asBytes(&expirations).ptr,
                 @sizeOf(u64),
             );
-            std.debug.print("timer expirations={}\n", .{expirations});
             now = time.time(null);
             _ = time.localtime_r(&now, &globals.titlebarState.currentTime);
-            //updateTitlebarState(globals);
+            updateTitlebarState(globals);
         }
+    }
+}
+
+fn updateTitlebarState(globals: Globals) void {
+    for (globals.outputs.items) |output| {
+        if (output.done) output.titlebar.redraw();
     }
 }
 
@@ -156,7 +161,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                     std.debug.print("ERROR: failed to create TitlebarSurface", .{});
                     return;
                 };
-                titlebar.globals = globals;
+                titlebar.* = .{ .globals = globals };
                 globals.outputs.append(globals.allocator, .{ .output = wlOutput, .name = global.name, .titlebar = titlebar }) catch {
                     std.debug.print("ERROR: failed to add output to list", .{});
                     return;
@@ -209,6 +214,13 @@ const TitlebarSurface = struct {
     width: u32 = 0,
     height: u32 = 0,
     scale: u32 = 1,
+    stride: u32 = 0,
+    fd: ?posix.fd_t = null,
+    data: ?[]align(std.heap.page_size_min) u8 = null,
+    pool: ?*wl.ShmPool = null,
+    buffers: [2]?*wl.Buffer = .{ null, null },
+    buffer_released: [2]bool = .{ true, true },
+    current_buffer: u32 = 0,
 
     pub fn create(self: *TitlebarSurface, output: *wl.Output) void {
         const compositor = self.globals.compositor orelse return;
@@ -244,6 +256,33 @@ const TitlebarSurface = struct {
     pub fn destroy(self: *TitlebarSurface) void {
         self.layer_surface.?.destroy();
         self.surface.?.destroy();
+
+        //TODO: destory buffer pool etc
+        if (self.pool) |pool| {
+            pool.destroy();
+            self.pool = null;
+        }
+    }
+
+    pub fn redraw(self: *TitlebarSurface) void {
+        const s = DrawableSurface{
+            .data = &(self.data.?)[self.stride * self.height * self.current_buffer],
+            .format = cairo.CAIRO_FORMAT_ARGB32,
+            .width = @intCast(self.width),
+            .height = @intCast(self.height),
+            .stride = @intCast(self.stride),
+            .scale = self.scale,
+        };
+        drawTitlebar(&s, &self.globals.titlebarState);
+        self.surface.?.damageBuffer(0, 0, @intCast(self.width), @intCast(self.height));
+        self.surface.?.attach(self.buffers[self.current_buffer].?, 0, 0);
+        self.surface.?.commit();
+
+        if (self.current_buffer == 0) { //TODO: check buffer released instead of this clunky ass bullshit
+            self.current_buffer = 1;
+        } else {
+            self.current_buffer = 0;
+        }
     }
 
     fn layerSurfaceListener(_: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, self: *TitlebarSurface) void {
@@ -255,54 +294,60 @@ const TitlebarSurface = struct {
                 self.height = configure.height * self.scale;
                 self.layer_surface.?.ackConfigure(configure.serial);
 
-                const buffer = blk: {
-                    const stride = self.width * 4;
-                    const size = stride * self.height;
+                self.stride = self.width * 4;
+                const size = self.stride * self.height;
 
-                    const fd = posix.memfd_create("hello-zig-wayland", 0) catch {
+                if (self.fd == null) {
+                    self.fd = posix.memfd_create("hello-zig-wayland", 0) catch {
                         std.debug.print("ERROR: titlebar memfd create failed", .{});
                         return;
                     };
-                    if (posix.errno(posix.system.ftruncate(fd, @intCast(size))) != .SUCCESS) {
-                        std.debug.print("layer surface listener truncate failed", .{});
-                    }
-                    const data = posix.mmap(
-                        null,
-                        @intCast(size),
-                        .{ .READ = true, .WRITE = true },
-                        .{ .TYPE = .SHARED },
-                        fd,
-                        0,
-                    ) catch {
-                        std.debug.print("ERROR: titlebar memory map failed", .{});
-                        return;
-                    };
+                }
+                if (posix.errno(posix.system.ftruncate(self.fd.?, @intCast(size * 2))) != .SUCCESS) {
+                    std.debug.print("layer surface listener truncate failed", .{});
+                }
 
-                    const s = DrawableSurface{
-                        .data = data.ptr,
-                        .format = cairo.CAIRO_FORMAT_ARGB32,
-                        .width = @intCast(self.width),
-                        .height = @intCast(self.height),
-                        .stride = @intCast(stride),
-                        .scale = self.scale,
-                    };
-                    drawTitlebar(&s, &self.globals.titlebarState);
-
-                    const pool = shm.createPool(fd, @intCast(size)) catch {
-                        std.debug.print("ERROR: titlebar create shm pool failed", .{});
-                        return;
-                    };
-                    defer pool.destroy();
-
-                    break :blk pool.createBuffer(0, @intCast(self.width), @intCast(self.height), @intCast(stride), wl.Shm.Format.argb8888) catch {
-                        std.debug.print("ERROR: titlebar create buffer failed", .{});
-                        return;
-                    };
+                if (self.data) |old| {
+                    posix.munmap(old);
+                    self.data = null;
+                }
+                self.data = posix.mmap(
+                    null,
+                    @intCast(size * 2),
+                    .{ .READ = true, .WRITE = true },
+                    .{ .TYPE = .SHARED },
+                    self.fd.?,
+                    0,
+                ) catch {
+                    std.debug.print("ERROR: titlebar memory map failed", .{});
+                    return;
                 };
-                defer buffer.destroy();
 
-                self.surface.?.attach(buffer, 0, 0);
-                self.surface.?.commit();
+                if (self.pool != null) {
+                    (self.pool.?).destroy();
+                    self.pool = null;
+                }
+                self.pool = shm.createPool(self.fd.?, @intCast(size * 2)) catch {
+                    std.debug.print("ERROR: titlebar create shm pool failed", .{});
+                    return;
+                };
+
+                if (self.buffers[0]) |buffer| {
+                    buffer.destroy();
+                }
+                if (self.buffers[1]) |buffer| {
+                    buffer.destroy();
+                }
+                self.buffers[0] = self.pool.?.createBuffer(0, @intCast(self.width), @intCast(self.height), @intCast(self.stride), wl.Shm.Format.argb8888) catch {
+                    std.debug.print("ERROR: titlebar create buffer failed", .{});
+                    return;
+                };
+                self.buffers[1] = self.pool.?.createBuffer(@intCast(size), @intCast(self.width), @intCast(self.height), @intCast(self.stride), wl.Shm.Format.argb8888) catch {
+                    std.debug.print("ERROR: titlebar create buffer failed", .{});
+                    return;
+                };
+
+                self.redraw();
             },
             .closed => {},
         }
