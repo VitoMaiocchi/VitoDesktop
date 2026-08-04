@@ -132,12 +132,12 @@ pub fn main() anyerror!void {
             );
             now = time.time(null);
             _ = time.localtime_r(&now, &globals.titlebarState.currentTime);
-            updateTitlebarState(globals);
+            updateTitlebarState(&globals);
         }
     }
 }
 
-fn updateTitlebarState(globals: Globals) void {
+fn updateTitlebarState(globals: *Globals) void {
     for (globals.outputs.items) |output| {
         if (output.done) output.titlebar.redraw();
     }
@@ -220,7 +220,7 @@ const TitlebarSurface = struct {
     pool: ?*wl.ShmPool = null,
     buffers: [2]?*wl.Buffer = .{ null, null },
     buffer_released: [2]bool = .{ true, true },
-    current_buffer: u32 = 0,
+    //double buffering is currently overkill
 
     pub fn create(self: *TitlebarSurface, output: *wl.Output) void {
         const compositor = self.globals.compositor orelse return;
@@ -257,16 +257,43 @@ const TitlebarSurface = struct {
         self.layer_surface.?.destroy();
         self.surface.?.destroy();
 
-        //TODO: destory buffer pool etc
+        if (self.buffers[0]) |buffer| {
+            buffer.destroy();
+            self.buffers[0] = null;
+        }
+        if (self.buffers[1]) |buffer| {
+            buffer.destroy();
+            self.buffers[1] = null;
+        }
+
         if (self.pool) |pool| {
             pool.destroy();
             self.pool = null;
         }
+
+        if (self.data) |data| {
+            posix.munmap(data);
+            self.data = null;
+        }
+
+        if (self.fd) |fd| {
+            _ = linux.close(fd);
+            self.fd = null;
+        }
+
+        self.globals.allocator.destroy(self);
     }
 
     pub fn redraw(self: *TitlebarSurface) void {
+        var buffer: u32 = undefined;
+        if (self.buffer_released[0]) {
+            buffer = 0;
+        } else if (self.buffer_released[1]) {
+            buffer = 1;
+        } else return;
+
         const s = DrawableSurface{
-            .data = &(self.data.?)[self.stride * self.height * self.current_buffer],
+            .data = &(self.data.?)[self.stride * self.height * buffer],
             .format = cairo.CAIRO_FORMAT_ARGB32,
             .width = @intCast(self.width),
             .height = @intCast(self.height),
@@ -274,15 +301,10 @@ const TitlebarSurface = struct {
             .scale = self.scale,
         };
         drawTitlebar(&s, &self.globals.titlebarState);
+        self.buffer_released[buffer] = false;
         self.surface.?.damageBuffer(0, 0, @intCast(self.width), @intCast(self.height));
-        self.surface.?.attach(self.buffers[self.current_buffer].?, 0, 0);
+        self.surface.?.attach(self.buffers[buffer].?, 0, 0);
         self.surface.?.commit();
-
-        if (self.current_buffer == 0) { //TODO: check buffer released instead of this clunky ass bullshit
-            self.current_buffer = 1;
-        } else {
-            self.current_buffer = 0;
-        }
     }
 
     fn layerSurfaceListener(_: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, self: *TitlebarSurface) void {
@@ -347,12 +369,31 @@ const TitlebarSurface = struct {
                     return;
                 };
 
+                self.buffers[0].?.setListener(*TitlebarSurface, buffer0, self);
+                self.buffers[1].?.setListener(*TitlebarSurface, buffer0, self);
+
                 self.redraw();
             },
             .closed => {},
         }
     }
 };
+
+fn buffer0(_: *wl.Buffer, event: wl.Buffer.Event, self: *TitlebarSurface) void {
+    switch (event) {
+        .release => {
+            self.buffer_released[0] = true;
+        },
+    }
+}
+
+fn buffer1(_: *wl.Buffer, event: wl.Buffer.Event, self: *TitlebarSurface) void {
+    switch (event) {
+        .release => {
+            self.buffer_released[1] = true;
+        },
+    }
+}
 
 fn drawTitlebar(surface: *const DrawableSurface, state: *const TitlebarState) void {
     const s: f64 = @floatFromInt(surface.scale);
