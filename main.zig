@@ -100,15 +100,24 @@ pub fn main(init: std.process.Init) anyerror!void {
     const path = try std.fmt.bufPrint(&addr.path, "{s}/hypr/{s}/.socket.sock", .{ xdg, his });
     addr.path[path.len] = 0;
 
-    const fd: i32 = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0));
-    defer _ = linux.close(fd);
+    const hyprSockFd: i32 = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0));
+    defer _ = linux.close(hyprSockFd);
 
-    _ = linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un));
+    _ = linux.connect(hyprSockFd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un));
     const wbuffer = "j/activeworkspace";
-    _ = linux.write(fd, wbuffer, wbuffer.len);
+    _ = linux.write(hyprSockFd, wbuffer, wbuffer.len);
     var rbuffer: [1000]u8 = undefined;
-    const n = linux.read(fd, &rbuffer, rbuffer.len);
+    var n = linux.read(hyprSockFd, &rbuffer, rbuffer.len);
     std.debug.print("{s}\n", .{rbuffer[0..n]});
+
+    var addr2: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    const path2 = try std.fmt.bufPrint(&addr2.path, "{s}/hypr/{s}/.socket2.sock", .{ xdg, his });
+    addr2.path[path2.len] = 0;
+
+    const hyprSock2Fd: i32 = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0));
+    defer _ = linux.close(hyprSock2Fd);
+
+    _ = linux.connect(hyprSock2Fd, @ptrCast(&addr2), @sizeOf(linux.sockaddr.un));
 
     while (true) {
         var fds = [_]std.posix.pollfd{ .{
@@ -117,6 +126,10 @@ pub fn main(init: std.process.Init) anyerror!void {
             .revents = 0,
         }, .{
             .fd = timerFd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }, .{
+            .fd = hyprSock2Fd,
             .events = std.posix.POLL.IN,
             .revents = 0,
         } };
@@ -131,6 +144,7 @@ pub fn main(init: std.process.Init) anyerror!void {
         _ = try std.posix.poll(&fds, -1);
         const wayland_fd_ready = (fds[0].revents & std.posix.POLL.IN) != 0;
         const timer_fd_ready = (fds[1].revents & std.posix.POLL.IN) != 0;
+        const hypr_fd_ready = (fds[2].revents & std.posix.POLL.IN) != 0;
 
         if (wayland_fd_ready) {
             if (display.readEvents() != .SUCCESS)
@@ -151,6 +165,15 @@ pub fn main(init: std.process.Init) anyerror!void {
             now = time.time(null);
             _ = time.localtime_r(&now, &globals.titlebarState.currentTime);
             updateTitlebarState(&globals);
+        }
+
+        if (hypr_fd_ready) {
+            var buffer: [4096]u8 = undefined;
+            n = linux.read(hyprSock2Fd, &buffer, buffer.len);
+
+            if (n > 0) {
+                std.debug.print("{s}", .{buffer[0..n]});
+            }
         }
     }
 }
