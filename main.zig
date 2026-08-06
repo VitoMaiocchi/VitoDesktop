@@ -47,7 +47,7 @@ const TitlebarState = struct {
     currentTime: time.struct_tm,
 };
 
-pub fn main() anyerror!void {
+pub fn main(init: std.process.Init) anyerror!void {
     const display = try wl.Display.connect(null);
     defer display.disconnect();
     const registry = try display.getRegistry();
@@ -91,6 +91,24 @@ pub fn main() anyerror!void {
     };
 
     _ = linux.timerfd_settime(timerFd, .{}, &spec, null);
+
+    //print current workspace
+    const xdg = init.environ_map.get("XDG_RUNTIME_DIR").?;
+    const his = init.environ_map.get("HYPRLAND_INSTANCE_SIGNATURE").?;
+
+    var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    const path = try std.fmt.bufPrint(&addr.path, "{s}/hypr/{s}/.socket.sock", .{ xdg, his });
+    addr.path[path.len] = 0;
+
+    const fd: i32 = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0));
+    defer _ = linux.close(fd);
+
+    _ = linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un));
+    const wbuffer = "j/activeworkspace";
+    _ = linux.write(fd, wbuffer, wbuffer.len);
+    var rbuffer: [1000]u8 = undefined;
+    const n = linux.read(fd, &rbuffer, rbuffer.len);
+    std.debug.print("{s}\n", .{rbuffer[0..n]});
 
     while (true) {
         var fds = [_]std.posix.pollfd{ .{
