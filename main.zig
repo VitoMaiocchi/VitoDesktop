@@ -198,7 +198,7 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                     std.debug.print("ERROR: failed to bind output", .{});
                     return;
                 };
-                const titlebar = LayerSurface.create(globals.allocator, globals, wlOutput, 0, 30, 30, .top, .{ .top = true, .left = true, .right = true }) catch {
+                const titlebar = LayerSurface.create(globals.allocator, globals, wlOutput, 0, 30, 30, .top, .{ .top = true, .left = true, .right = true }, TitlebarState, drawTitlebar, &globals.titlebarState) catch {
                     std.debug.print("ERROR CREATING TITLEBAR", .{});
                     return;
                 };
@@ -260,8 +260,22 @@ const LayerSurface = struct {
     pool: ?*wl.ShmPool = null,
     buffers: [2]?*wl.Buffer = .{ null, null },
     buffer_released: [2]bool = .{ true, true },
+    drawCallback: *const fn (surface: *const DrawableSurface, data: *anyopaque) void,
+    drawData: *anyopaque,
 
-    pub fn create(allocator: std.mem.Allocator, globals: *Globals, output: ?*wl.Output, width: u32, height: u32, exclusiveZone: i32, layer: zwlr.LayerShellV1.Layer, anchor: zwlr.LayerSurfaceV1.Anchor) !*LayerSurface {
+    pub fn create(
+        allocator: std.mem.Allocator,
+        globals: *Globals,
+        output: ?*wl.Output,
+        width: u32,
+        height: u32,
+        exclusiveZone: i32,
+        layer: zwlr.LayerShellV1.Layer,
+        anchor: zwlr.LayerSurfaceV1.Anchor,
+        comptime DrawDataType: type,
+        drawCallback: *const fn (surface: *const DrawableSurface, data: *DrawDataType) void,
+        drawData: *DrawDataType,
+    ) !*LayerSurface {
         const compositor = globals.compositor orelse @panic("no Compositor");
         const layer_shell = globals.layer_shell orelse @panic("no LayerShell");
         const surface = try compositor.createSurface();
@@ -277,7 +291,13 @@ const LayerSurface = struct {
         layer_surface.setExclusiveZone(exclusiveZone);
 
         const layerSurface = try allocator.create(LayerSurface);
-        layerSurface.* = .{ .globals = globals, .surface = surface, .layer_surface = layer_surface };
+        layerSurface.* = .{
+            .globals = globals,
+            .surface = surface,
+            .layer_surface = layer_surface,
+            .drawCallback = @ptrCast(drawCallback),
+            .drawData = @ptrCast(drawData),
+        };
 
         layer_surface.setListener(*LayerSurface, layerSurfaceListener, layerSurface);
         return layerSurface;
@@ -336,7 +356,7 @@ const LayerSurface = struct {
             .stride = @intCast(self.stride),
             .scale = self.scale,
         };
-        drawTitlebar(&s, &self.globals.titlebarState);
+        self.drawCallback(&s, self.drawData);
         self.buffer_released[buffer] = false;
         self.surface.damageBuffer(0, 0, @intCast(self.width), @intCast(self.height));
         self.surface.attach(self.buffers[buffer].?, 0, 0);
