@@ -47,6 +47,88 @@ const TitlebarState = struct {
     currentTime: time.struct_tm,
 };
 
+const EventSource = struct {
+    fd: std.posix.fd_t,
+    events: i16,
+
+    dispatchFn: *const fn (event: *const EventSource) anyerror!void,
+    context: ?*anyopaque,
+
+    pub fn dispatch(self: *const EventSource) anyerror!void {
+        return self.dispatchFn(self);
+    }
+};
+
+fn dispatchTimerEvent(event: *const EventSource) anyerror!void {
+    const globals: *Globals = @ptrCast(@alignCast(event.context.?));
+    var expirations: u64 = undefined;
+    _ = linux.read(
+        event.fd,
+        std.mem.asBytes(&expirations).ptr,
+        @sizeOf(u64),
+    );
+    const now = time.time(null);
+    _ = time.localtime_r(&now, &globals.titlebarState.currentTime);
+    updateTitlebarState(globals);
+}
+
+fn initializeTimerEvent(globals: *const Globals) EventSource {
+    const fd: i32 = @intCast(linux.timerfd_create(linux.timerfd_clockid_t.MONOTONIC, .{}));
+
+    var spec = linux.itimerspec{
+        .it_interval = .{
+            .sec = 1,
+            .nsec = 0, // 0.5 s
+        },
+        .it_value = .{
+            .sec = 1,
+            .nsec = 0, // first expiration after 0.5 s
+        },
+    };
+
+    _ = linux.timerfd_settime(fd, .{}, &spec, null);
+
+    return .{ .fd = fd, .events = std.posix.POLL.IN, .dispatchFn = dispatchTimerEvent, .context = @ptrCast(@constCast(globals)) };
+}
+
+fn dispatchHyprlandEvent(event: *const EventSource) anyerror!void {
+    var buffer: [4096]u8 = undefined;
+    const n = linux.read(event.fd, &buffer, buffer.len);
+
+    if (n > 0) {
+        std.debug.print("{s}", .{buffer[0..n]});
+    }
+}
+
+fn initializeHyprlandEvent(init: std.process.Init) !EventSource { //print current workspace
+    const xdg = init.environ_map.get("XDG_RUNTIME_DIR").?;
+    const his = init.environ_map.get("HYPRLAND_INSTANCE_SIGNATURE").?;
+
+    var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    const path = try std.fmt.bufPrint(&addr.path, "{s}/hypr/{s}/.socket.sock", .{ xdg, his });
+    addr.path[path.len] = 0;
+
+    const hyprSockFd: i32 = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0));
+    defer _ = linux.close(hyprSockFd);
+
+    _ = linux.connect(hyprSockFd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un));
+    const wbuffer = "j/activeworkspace";
+    _ = linux.write(hyprSockFd, wbuffer, wbuffer.len);
+    var rbuffer: [1000]u8 = undefined;
+    const n = linux.read(hyprSockFd, &rbuffer, rbuffer.len);
+    std.debug.print("{s}\n", .{rbuffer[0..n]});
+
+    var addr2: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
+    const path2 = try std.fmt.bufPrint(&addr2.path, "{s}/hypr/{s}/.socket2.sock", .{ xdg, his });
+    addr2.path[path2.len] = 0;
+
+    const fd: i32 = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0));
+
+    _ = linux.connect(fd, @ptrCast(&addr2), @sizeOf(linux.sockaddr.un));
+
+    return .{ .fd = fd, .events = std.posix.POLL.IN, .dispatchFn = dispatchHyprlandEvent, .context = null };
+}
+
 pub fn main(init: std.process.Init) anyerror!void {
     const display = try wl.Display.connect(null);
     defer display.disconnect();
@@ -77,47 +159,9 @@ pub fn main(init: std.process.Init) anyerror!void {
     defer layer_shell.destroy();
 
     const wlFd: i32 = display.getFd();
-    const timerFd: i32 = @intCast(linux.timerfd_create(linux.timerfd_clockid_t.MONOTONIC, .{}));
 
-    var spec = linux.itimerspec{
-        .it_interval = .{
-            .sec = 1,
-            .nsec = 0, // 0.5 s
-        },
-        .it_value = .{
-            .sec = 1,
-            .nsec = 0, // first expiration after 0.5 s
-        },
-    };
-
-    _ = linux.timerfd_settime(timerFd, .{}, &spec, null);
-
-    //print current workspace
-    const xdg = init.environ_map.get("XDG_RUNTIME_DIR").?;
-    const his = init.environ_map.get("HYPRLAND_INSTANCE_SIGNATURE").?;
-
-    var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
-    const path = try std.fmt.bufPrint(&addr.path, "{s}/hypr/{s}/.socket.sock", .{ xdg, his });
-    addr.path[path.len] = 0;
-
-    const hyprSockFd: i32 = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0));
-    defer _ = linux.close(hyprSockFd);
-
-    _ = linux.connect(hyprSockFd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un));
-    const wbuffer = "j/activeworkspace";
-    _ = linux.write(hyprSockFd, wbuffer, wbuffer.len);
-    var rbuffer: [1000]u8 = undefined;
-    var n = linux.read(hyprSockFd, &rbuffer, rbuffer.len);
-    std.debug.print("{s}\n", .{rbuffer[0..n]});
-
-    var addr2: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = undefined };
-    const path2 = try std.fmt.bufPrint(&addr2.path, "{s}/hypr/{s}/.socket2.sock", .{ xdg, his });
-    addr2.path[path2.len] = 0;
-
-    const hyprSock2Fd: i32 = @intCast(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0));
-    defer _ = linux.close(hyprSock2Fd);
-
-    _ = linux.connect(hyprSock2Fd, @ptrCast(&addr2), @sizeOf(linux.sockaddr.un));
+    const hyperland = try initializeHyprlandEvent(init);
+    const timer = initializeTimerEvent(&globals);
 
     while (true) {
         var fds = [_]std.posix.pollfd{ .{
@@ -125,12 +169,12 @@ pub fn main(init: std.process.Init) anyerror!void {
             .events = std.posix.POLL.IN,
             .revents = 0,
         }, .{
-            .fd = timerFd,
-            .events = std.posix.POLL.IN,
+            .fd = timer.fd,
+            .events = timer.events,
             .revents = 0,
         }, .{
-            .fd = hyprSock2Fd,
-            .events = std.posix.POLL.IN,
+            .fd = hyperland.fd,
+            .events = hyperland.events,
             .revents = 0,
         } };
 
@@ -155,30 +199,15 @@ pub fn main(init: std.process.Init) anyerror!void {
 
         _ = display.dispatchPending();
 
-        if (timer_fd_ready) {
-            var expirations: u64 = undefined;
-            _ = linux.read(
-                timerFd,
-                std.mem.asBytes(&expirations).ptr,
-                @sizeOf(u64),
-            );
-            now = time.time(null);
-            _ = time.localtime_r(&now, &globals.titlebarState.currentTime);
-            updateTitlebarState(&globals);
-        }
-
-        if (hypr_fd_ready) {
-            var buffer: [4096]u8 = undefined;
-            n = linux.read(hyprSock2Fd, &buffer, buffer.len);
-
-            if (n > 0) {
-                std.debug.print("{s}", .{buffer[0..n]});
-            }
-        }
+        if (timer_fd_ready) try timer.dispatch();
+        if (hypr_fd_ready) try hyperland.dispatch();
     }
+
+    linux.close(timer.fd);
+    linux.close(hyperland.fd);
 }
 
-fn updateTitlebarState(globals: *Globals) void {
+fn updateTitlebarState(globals: *const Globals) void {
     for (globals.outputs.items) |output| {
         if (output.done) output.titlebar.redraw();
     }
