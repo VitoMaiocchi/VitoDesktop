@@ -22,7 +22,7 @@ const Output = struct {
     height: i32 = 0,
     scale: i32 = 1,
     done: bool = false, // set once compositor signals this output's info is complete
-    titlebar: *TitlebarSurface,
+    titlebar: *LayerSurface,
 };
 
 const Globals = struct {
@@ -198,17 +198,16 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                     std.debug.print("ERROR: failed to bind output", .{});
                     return;
                 };
-                const titlebar = globals.allocator.create(TitlebarSurface) catch {
-                    std.debug.print("ERROR: failed to create TitlebarSurface", .{});
+                const titlebar = LayerSurface.create(globals.allocator, globals, wlOutput, 0, 30, 30, .top, .{ .top = true, .left = true, .right = true }) catch {
+                    std.debug.print("ERROR CREATING TITLEBAR", .{});
                     return;
                 };
-                titlebar.* = .{ .globals = globals };
+
                 globals.outputs.append(globals.allocator, .{ .output = wlOutput, .name = global.name, .titlebar = titlebar }) catch {
                     std.debug.print("ERROR: failed to add output to list", .{});
                     return;
                 };
                 const output = &globals.outputs.items[globals.outputs.items.len - 1];
-                output.titlebar.create(output.output);
                 wlOutput.setListener(*Output, outputListener, output);
                 std.debug.print("output {} has been created\n", .{output.name});
             }
@@ -248,10 +247,10 @@ fn outputListener(_: *wl.Output, event: wl.Output.Event, info: *Output) void {
     }
 }
 
-const TitlebarSurface = struct {
+const LayerSurface = struct {
     globals: *Globals,
-    surface: ?*wl.Surface = null,
-    layer_surface: ?*zwlr.LayerSurfaceV1 = null,
+    surface: *wl.Surface,
+    layer_surface: *zwlr.LayerSurfaceV1,
     width: u32 = 0,
     height: u32 = 0,
     scale: u32 = 1,
@@ -261,42 +260,38 @@ const TitlebarSurface = struct {
     pool: ?*wl.ShmPool = null,
     buffers: [2]?*wl.Buffer = .{ null, null },
     buffer_released: [2]bool = .{ true, true },
-    //double buffering is currently overkill
 
-    pub fn create(self: *TitlebarSurface, output: *wl.Output) void {
-        const compositor = self.globals.compositor orelse return;
-        const layer_shell = self.globals.layer_shell orelse return;
-        self.surface = compositor.createSurface() catch {
-            std.debug.print("ERROR: failed to create titlebar surface", .{});
-            return;
-        };
-
-        self.layer_surface = layer_shell.getLayerSurface(
-            self.surface.?,
+    pub fn create(allocator: std.mem.Allocator, globals: *Globals, output: ?*wl.Output, width: u32, height: u32, exclusiveZone: i32, layer: zwlr.LayerShellV1.Layer, anchor: zwlr.LayerSurfaceV1.Anchor) !*LayerSurface {
+        const compositor = globals.compositor orelse @panic("no Compositor");
+        const layer_shell = globals.layer_shell orelse @panic("no LayerShell");
+        const surface = try compositor.createSurface();
+        const layer_surface = try layer_shell.getLayerSurface(
+            surface,
             output,
-            .top, // layer: background/bottom/top/overlay
+            layer,
             "hello-zig-wayland",
-        ) catch {
-            std.debug.print("ERROR: failed to get titlebar layer surface", .{});
-            return;
-        };
+        );
 
-        self.layer_surface.?.setAnchor(.{ .top = true, .left = true, .right = true });
-        self.layer_surface.?.setSize(0, 30);
-        self.layer_surface.?.setExclusiveZone(30); // 0 = don't reserve space; set >0 for a real bar
+        layer_surface.setAnchor(anchor);
+        layer_surface.setSize(width, height);
+        layer_surface.setExclusiveZone(exclusiveZone);
 
-        self.layer_surface.?.setListener(*TitlebarSurface, layerSurfaceListener, self);
+        const layerSurface = try allocator.create(LayerSurface);
+        layerSurface.* = .{ .globals = globals, .surface = surface, .layer_surface = layer_surface };
+
+        layer_surface.setListener(*LayerSurface, layerSurfaceListener, layerSurface);
+        return layerSurface;
     }
 
-    pub fn commit(self: *TitlebarSurface, scale: i32) void {
+    pub fn commit(self: *LayerSurface, scale: i32) void {
         self.scale = @intCast(scale);
-        self.surface.?.setBufferScale(scale);
-        self.surface.?.commit();
+        self.surface.setBufferScale(scale);
+        self.surface.commit();
     }
 
-    pub fn destroy(self: *TitlebarSurface) void {
-        self.layer_surface.?.destroy();
-        self.surface.?.destroy();
+    pub fn destroy(self: *LayerSurface) void {
+        self.layer_surface.destroy();
+        self.surface.destroy();
 
         if (self.buffers[0]) |buffer| {
             buffer.destroy();
@@ -325,7 +320,7 @@ const TitlebarSurface = struct {
         self.globals.allocator.destroy(self);
     }
 
-    pub fn redraw(self: *TitlebarSurface) void {
+    pub fn redraw(self: *LayerSurface) void {
         var buffer: u32 = undefined;
         if (self.buffer_released[0]) {
             buffer = 0;
@@ -343,26 +338,26 @@ const TitlebarSurface = struct {
         };
         drawTitlebar(&s, &self.globals.titlebarState);
         self.buffer_released[buffer] = false;
-        self.surface.?.damageBuffer(0, 0, @intCast(self.width), @intCast(self.height));
-        self.surface.?.attach(self.buffers[buffer].?, 0, 0);
-        self.surface.?.commit();
+        self.surface.damageBuffer(0, 0, @intCast(self.width), @intCast(self.height));
+        self.surface.attach(self.buffers[buffer].?, 0, 0);
+        self.surface.commit();
     }
 
-    fn layerSurfaceListener(_: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, self: *TitlebarSurface) void {
+    fn layerSurfaceListener(_: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, self: *LayerSurface) void {
         switch (event) {
             .configure => |configure| {
                 const shm = self.globals.shm orelse return;
 
                 self.width = configure.width * self.scale;
                 self.height = configure.height * self.scale;
-                self.layer_surface.?.ackConfigure(configure.serial);
+                self.layer_surface.ackConfigure(configure.serial);
 
                 self.stride = self.width * 4;
                 const size = self.stride * self.height;
 
                 if (self.fd == null) {
                     self.fd = posix.memfd_create("hello-zig-wayland", 0) catch {
-                        std.debug.print("ERROR: titlebar memfd create failed", .{});
+                        std.debug.print("ERROR: layersurface memfd create failed", .{});
                         return;
                     };
                 }
@@ -382,7 +377,7 @@ const TitlebarSurface = struct {
                     self.fd.?,
                     0,
                 ) catch {
-                    std.debug.print("ERROR: titlebar memory map failed", .{});
+                    std.debug.print("ERROR: layersurface memory map failed", .{});
                     return;
                 };
 
@@ -391,7 +386,7 @@ const TitlebarSurface = struct {
                     self.pool = null;
                 }
                 self.pool = shm.createPool(self.fd.?, @intCast(size * 2)) catch {
-                    std.debug.print("ERROR: titlebar create shm pool failed", .{});
+                    std.debug.print("ERROR: layersurface create shm pool failed", .{});
                     return;
                 };
 
@@ -402,39 +397,39 @@ const TitlebarSurface = struct {
                     buffer.destroy();
                 }
                 self.buffers[0] = self.pool.?.createBuffer(0, @intCast(self.width), @intCast(self.height), @intCast(self.stride), wl.Shm.Format.argb8888) catch {
-                    std.debug.print("ERROR: titlebar create buffer failed", .{});
+                    std.debug.print("ERROR: layersurface create buffer failed", .{});
                     return;
                 };
                 self.buffers[1] = self.pool.?.createBuffer(@intCast(size), @intCast(self.width), @intCast(self.height), @intCast(self.stride), wl.Shm.Format.argb8888) catch {
-                    std.debug.print("ERROR: titlebar create buffer failed", .{});
+                    std.debug.print("ERROR: layersurface create buffer failed", .{});
                     return;
                 };
 
-                self.buffers[0].?.setListener(*TitlebarSurface, buffer0, self);
-                self.buffers[1].?.setListener(*TitlebarSurface, buffer0, self);
+                self.buffers[0].?.setListener(*LayerSurface, buffer0, self);
+                self.buffers[1].?.setListener(*LayerSurface, buffer1, self);
 
                 self.redraw();
             },
             .closed => {},
         }
     }
+
+    fn buffer0(_: *wl.Buffer, event: wl.Buffer.Event, self: *LayerSurface) void {
+        switch (event) {
+            .release => {
+                self.buffer_released[0] = true;
+            },
+        }
+    }
+
+    fn buffer1(_: *wl.Buffer, event: wl.Buffer.Event, self: *LayerSurface) void {
+        switch (event) {
+            .release => {
+                self.buffer_released[1] = true;
+            },
+        }
+    }
 };
-
-fn buffer0(_: *wl.Buffer, event: wl.Buffer.Event, self: *TitlebarSurface) void {
-    switch (event) {
-        .release => {
-            self.buffer_released[0] = true;
-        },
-    }
-}
-
-fn buffer1(_: *wl.Buffer, event: wl.Buffer.Event, self: *TitlebarSurface) void {
-    switch (event) {
-        .release => {
-            self.buffer_released[1] = true;
-        },
-    }
-}
 
 fn drawTitlebar(surface: *const DrawableSurface, state: *const TitlebarState) void {
     const s: f64 = @floatFromInt(surface.scale);
