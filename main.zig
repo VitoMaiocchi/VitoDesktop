@@ -15,23 +15,10 @@ const time = @cImport({
     @cInclude("time.h");
 });
 
-const Output = struct {
-    output: *wl.Output,
-    name: u32, // the wl_registry global name, useful as a stable key
-    width: i32 = 0,
-    height: i32 = 0,
-    scale: i32 = 1,
-    done: bool = false, // set once compositor signals this output's info is complete
-    titlebar: *LayerSurface,
-};
-
 const Globals = struct {
-    shm: ?*wl.Shm,
-    compositor: ?*wl.Compositor,
-    layer_shell: ?*zwlr.LayerShellV1,
-    outputs: std.ArrayList(Output),
     allocator: std.mem.Allocator,
-    titlebarState: TitlebarState,
+    titlebarState: *TitlebarState,
+    wayland: *Wayland,
 };
 
 const DrawableSurface = struct {
@@ -126,158 +113,343 @@ fn initializeHyprlandEvent(init: std.process.Init) !EventSource { //print curren
 
     _ = linux.connect(fd, @ptrCast(&addr2), @sizeOf(linux.sockaddr.un));
 
-    return .{ .fd = fd, .events = std.posix.POLL.IN, .dispatchFn = dispatchHyprlandEvent, .context = null };
+    return .{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .dispatchFn = dispatchHyprlandEvent,
+        .context = null,
+    };
+}
+
+const Wayland = struct {
+    const OutputFn = *const fn (wayland: *Wayland, output: *Output, data: ?*anyopaque) anyerror!void;
+
+    allocator: std.mem.Allocator,
+    display: *wl.Display,
+    registry: *wl.Registry,
+    shm: ?*wl.Shm,
+    compositor: ?*wl.Compositor,
+    layer_shell: ?*zwlr.LayerShellV1,
+    outputs: std.ArrayList(Output),
+    eventSources: std.ArrayList(EventSource),
+    createOutputFn: OutputFn,
+    updateOutputFn: OutputFn,
+    destroyOutputFn: OutputFn,
+    data: ?*anyopaque, //user data
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        createOutputCallback: OutputFn,
+        updateOutputCallback: OutputFn,
+        destroyOutputCallback: OutputFn,
+        data: ?*anyopaque, //user data
+    ) !*Wayland {
+        const display = try wl.Display.connect(null);
+        const registry = try display.getRegistry();
+
+        const self = try allocator.create(Wayland);
+        self.* = .{
+            .allocator = allocator,
+            .display = display,
+            .registry = registry,
+            .shm = null,
+            .compositor = null,
+            .layer_shell = null,
+            .outputs = std.ArrayList(Output).empty,
+            .eventSources = std.ArrayList(EventSource).empty,
+            .createOutputFn = createOutputCallback,
+            .updateOutputFn = updateOutputCallback,
+            .destroyOutputFn = destroyOutputCallback,
+            .data = data,
+        };
+
+        registry.setListener(*Wayland, registryListener, self);
+        if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+        return self;
+    }
+
+    pub fn registerEventSource(self: *Wayland, eventSource: EventSource) !void {
+        try self.eventSources.append(self.allocator, eventSource);
+    }
+
+    pub fn runMainLoop(self: *Wayland) !void {
+        const shm = self.shm orelse return error.NoWlShm;
+        defer shm.destroy();
+        const compositor = self.compositor orelse return error.NoWlCompositor;
+        defer compositor.destroy();
+        const layer_shell = self.layer_shell orelse return error.NoLayerShell;
+        defer layer_shell.destroy();
+
+        const wlFd: i32 = self.display.getFd();
+
+        const sourceLen = self.eventSources.items.len;
+        var fds = try self.allocator.alloc(std.posix.pollfd, sourceLen + 1);
+        defer self.allocator.free(fds);
+
+        while (true) { //TODO: add sig interrupt
+            for (self.eventSources.items, 0..) |source, i| {
+                fds[i] = .{
+                    .fd = source.fd,
+                    .events = source.events,
+                    .revents = 0,
+                };
+            }
+            fds[sourceLen] = .{
+                .fd = wlFd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            };
+
+            if (!self.display.prepareRead()) {
+                _ = self.display.dispatchPending();
+                continue;
+            }
+
+            _ = self.display.flush();
+
+            _ = try std.posix.poll(fds, -1);
+
+            const wayland_fd_ready = (fds[sourceLen].revents & std.posix.POLL.IN) != 0;
+            if (wayland_fd_ready) {
+                if (self.display.readEvents() != .SUCCESS)
+                    return error.ReadFailed;
+            } else {
+                self.display.cancelRead();
+            }
+
+            _ = self.display.dispatchPending();
+
+            for (self.eventSources.items, 0..) |source, i| {
+                const fd_ready = (fds[i].revents & std.posix.POLL.IN) != 0;
+                if (fd_ready) {
+                    try source.dispatch();
+                }
+            }
+        }
+
+        for (self.eventSources.items) |source| {
+            linux.close(source.fd);
+        }
+    }
+
+    pub fn destroy(self: *Wayland) void {
+        self.display.disconnect();
+        self.registry.destroy();
+        self.allocator.destroy(self);
+    }
+
+    fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Wayland) void {
+        switch (event) {
+            .global => |global| {
+                if (mem.orderZ(u8, global.interface, wl.Compositor.interface.name) == .eq) {
+                    self.compositor = registry.bind(global.name, wl.Compositor, 4) catch return;
+                } else if (mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
+                    self.shm = registry.bind(global.name, wl.Shm, 1) catch return;
+                } else if (mem.orderZ(u8, global.interface, zwlr.LayerShellV1.interface.name) == .eq) {
+                    self.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, 1) catch return;
+                } else if (mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
+                    const wlOutput = registry.bind(global.name, wl.Output, 4) catch {
+                        std.debug.print("ERROR: failed to bind output", .{});
+                        return;
+                    };
+                    self.outputs.append(self.allocator, .{
+                        .output = wlOutput,
+                        .name = global.name,
+                    }) catch {
+                        std.debug.print("ERROR: failed to add output to list", .{});
+                        return;
+                    };
+                    const output = &self.outputs.items[self.outputs.items.len - 1];
+                    wlOutput.setListener(*Wayland, outputListener, self);
+                    std.debug.print("output {} has been created\n", .{output.name});
+                    self.createOutputFn(self, output, self.data) catch {
+                        //TODO: better error handling
+                        std.debug.print("ERROR", .{});
+                        return;
+                    };
+                }
+            },
+            .global_remove => |remove| {
+                for (self.outputs.items, 0..) |o, i| {
+                    if (o.name == remove.name) {
+                        o.output.release();
+                        var output = self.outputs.swapRemove(i);
+                        std.debug.print("output {} is released\n", .{output.name});
+                        self.destroyOutputFn(self, &output, self.data) catch {
+                            //TODO: better error handling
+                            std.debug.print("ERROR", .{});
+                            return;
+                        };
+                        break;
+                    }
+                }
+            },
+        }
+    }
+
+    fn outputListener(wlOutput: *wl.Output, event: wl.Output.Event, self: *Wayland) void {
+        const output: *Output = for (self.outputs.items, 0..) |o, i| {
+            if (o.output == wlOutput)
+                break &self.outputs.items[i];
+        } else {
+            @panic("Output not in output list");
+        };
+
+        switch (event) {
+            .mode => |mode| {
+                if (mode.flags.current) {
+                    output.width = mode.width;
+                    output.height = mode.height;
+                }
+            },
+            .scale => |scale_event| {
+                output.scale = scale_event.factor;
+            },
+            .geometry => {},
+            .done => {
+                output.done = true;
+                std.debug.print("Output {} info updated:\n  size={}x{}\n  scale={}\n", .{ output.name, output.height, output.width, output.scale });
+                self.updateOutputFn(self, output, self.data) catch {
+                    //TODO: better error handling
+                    std.debug.print("ERROR", .{});
+                    return;
+                };
+            },
+            else => {},
+        }
+    }
+
+    pub const Output = struct {
+        output: *wl.Output,
+        name: u32, // the wl_registry global name, useful as a stable key
+        width: i32 = 0,
+        height: i32 = 0,
+        scale: i32 = 1,
+        done: bool = false, // set once compositor signals this output's info is complete
+        data: ?*anyopaque = null, //user data
+    };
+};
+
+fn outputCreate(wls: *Wayland, output: *Wayland.Output, data: ?*anyopaque) !void {
+    const titlebarState: *TitlebarState = @ptrCast(@alignCast(data orelse @panic("Wayland data is null")));
+    const titlebar = LayerSurface.create(wls.allocator, wls, output.output, 0, 30, 30, .top, .{ .top = true, .left = true, .right = true }, TitlebarState, drawTitlebar, titlebarState) catch {
+        std.debug.print("ERROR CREATING TITLEBAR", .{});
+        return;
+    };
+    output.data = titlebar;
+}
+
+fn outputUpdate(_: *Wayland, output: *Wayland.Output, _: ?*anyopaque) !void {
+    const titlebar: *LayerSurface = @ptrCast(@alignCast(output.data orelse @panic("Wayland Output data is null")));
+    titlebar.commit(output.scale);
+}
+
+fn outputDestroy(_: *Wayland, output: *Wayland.Output, _: ?*anyopaque) !void {
+    const titlebar: *LayerSurface = @ptrCast(@alignCast(output.data orelse @panic("Wayland Output data is null")));
+    titlebar.destroy();
 }
 
 pub fn main(init: std.process.Init) anyerror!void {
-    const display = try wl.Display.connect(null);
-    defer display.disconnect();
-    const registry = try display.getRegistry();
-    defer registry.destroy();
+    // const display = try wl.Display.connect(null);
+    // defer display.disconnect();
+    // const registry = try display.getRegistry();
+    // defer registry.destroy();
 
     var now: time.time_t = time.time(null);
     var tm: time.struct_tm = undefined;
     _ = time.localtime_r(&now, &tm);
 
+    // var globals = Globals{
+    //     .shm = null,
+    //     .compositor = null,
+    //     .layer_shell = null,
+    //     .outputs = std.ArrayList(Output).empty,
+    //     .allocator = std.heap.page_allocator,
+    //     .titlebarState = TitlebarState{ .currentTime = tm },
+    // };
+
+    // registry.setListener(*Globals, registryListener, &globals);
+    // if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+
+    // const shm = globals.shm orelse return error.NoWlShm;
+    // defer shm.destroy();
+    // const compositor = globals.compositor orelse return error.NoWlCompositor;
+    // defer compositor.destroy();
+    // const layer_shell = globals.layer_shell orelse return error.NoLayerShell;
+    // defer layer_shell.destroy();
+
+    // const wlFd: i32 = display.getFd();
+    const allocator = std.heap.page_allocator;
+    var titlebarState = TitlebarState{ .currentTime = tm };
+    const wls = try Wayland.init(std.heap.page_allocator, outputCreate, outputUpdate, outputDestroy, @ptrCast(@constCast(&titlebarState)));
+    defer wls.destroy();
+
     var globals = Globals{
-        .shm = null,
-        .compositor = null,
-        .layer_shell = null,
-        .outputs = std.ArrayList(Output).empty,
-        .allocator = std.heap.page_allocator,
-        .titlebarState = TitlebarState{ .currentTime = tm },
+        .allocator = allocator,
+        .titlebarState = &titlebarState,
+        .wayland = wls,
     };
 
-    registry.setListener(*Globals, registryListener, &globals);
-    if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+    try globals.wayland.registerEventSource(try initializeHyprlandEvent(init));
+    try globals.wayland.registerEventSource(initializeTimerEvent(&globals));
 
-    const shm = globals.shm orelse return error.NoWlShm;
-    defer shm.destroy();
-    const compositor = globals.compositor orelse return error.NoWlCompositor;
-    defer compositor.destroy();
-    const layer_shell = globals.layer_shell orelse return error.NoLayerShell;
-    defer layer_shell.destroy();
+    try globals.wayland.runMainLoop();
 
-    const wlFd: i32 = display.getFd();
+    // while (true) {
+    //     var fds = [_]std.posix.pollfd{ .{
+    //         .fd = wlFd,
+    //         .events = std.posix.POLL.IN,
+    //         .revents = 0,
+    //     }, .{
+    //         .fd = timer.fd,
+    //         .events = timer.events,
+    //         .revents = 0,
+    //     }, .{
+    //         .fd = hyperland.fd,
+    //         .events = hyperland.events,
+    //         .revents = 0,
+    //     } };
 
-    const hyperland = try initializeHyprlandEvent(init);
-    const timer = initializeTimerEvent(&globals);
+    //     if (!display.prepareRead()) {
+    //         _ = display.dispatchPending();
+    //         continue;
+    //     }
 
-    while (true) {
-        var fds = [_]std.posix.pollfd{ .{
-            .fd = wlFd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }, .{
-            .fd = timer.fd,
-            .events = timer.events,
-            .revents = 0,
-        }, .{
-            .fd = hyperland.fd,
-            .events = hyperland.events,
-            .revents = 0,
-        } };
+    //     _ = display.flush();
 
-        if (!display.prepareRead()) {
-            _ = display.dispatchPending();
-            continue;
-        }
+    //     _ = try std.posix.poll(&fds, -1);
+    //     const wayland_fd_ready = (fds[0].revents & std.posix.POLL.IN) != 0;
+    //     const timer_fd_ready = (fds[1].revents & std.posix.POLL.IN) != 0;
+    //     const hypr_fd_ready = (fds[2].revents & std.posix.POLL.IN) != 0;
 
-        _ = display.flush();
+    //     if (wayland_fd_ready) {
+    //         if (display.readEvents() != .SUCCESS)
+    //             return error.ReadFailed;
+    //     } else {
+    //         display.cancelRead();
+    //     }
 
-        _ = try std.posix.poll(&fds, -1);
-        const wayland_fd_ready = (fds[0].revents & std.posix.POLL.IN) != 0;
-        const timer_fd_ready = (fds[1].revents & std.posix.POLL.IN) != 0;
-        const hypr_fd_ready = (fds[2].revents & std.posix.POLL.IN) != 0;
+    //     _ = display.dispatchPending();
 
-        if (wayland_fd_ready) {
-            if (display.readEvents() != .SUCCESS)
-                return error.ReadFailed;
-        } else {
-            display.cancelRead();
-        }
+    //     if (timer_fd_ready) try timer.dispatch();
+    //     if (hypr_fd_ready) try hyperland.dispatch();
+    // }
 
-        _ = display.dispatchPending();
-
-        if (timer_fd_ready) try timer.dispatch();
-        if (hypr_fd_ready) try hyperland.dispatch();
-    }
-
-    linux.close(timer.fd);
-    linux.close(hyperland.fd);
+    // linux.close(timer.fd);
+    // linux.close(hyperland.fd);
 }
 
 fn updateTitlebarState(globals: *const Globals) void {
-    for (globals.outputs.items) |output| {
-        if (output.done) output.titlebar.redraw();
-    }
-}
-
-fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *Globals) void {
-    switch (event) {
-        .global => |global| {
-            if (mem.orderZ(u8, global.interface, wl.Compositor.interface.name) == .eq) {
-                globals.compositor = registry.bind(global.name, wl.Compositor, 4) catch return;
-            } else if (mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
-                globals.shm = registry.bind(global.name, wl.Shm, 1) catch return;
-            } else if (mem.orderZ(u8, global.interface, zwlr.LayerShellV1.interface.name) == .eq) {
-                globals.layer_shell = registry.bind(global.name, zwlr.LayerShellV1, 1) catch return;
-            } else if (mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
-                const wlOutput = registry.bind(global.name, wl.Output, 4) catch {
-                    std.debug.print("ERROR: failed to bind output", .{});
-                    return;
-                };
-                const titlebar = LayerSurface.create(globals.allocator, globals, wlOutput, 0, 30, 30, .top, .{ .top = true, .left = true, .right = true }, TitlebarState, drawTitlebar, &globals.titlebarState) catch {
-                    std.debug.print("ERROR CREATING TITLEBAR", .{});
-                    return;
-                };
-
-                globals.outputs.append(globals.allocator, .{ .output = wlOutput, .name = global.name, .titlebar = titlebar }) catch {
-                    std.debug.print("ERROR: failed to add output to list", .{});
-                    return;
-                };
-                const output = &globals.outputs.items[globals.outputs.items.len - 1];
-                wlOutput.setListener(*Output, outputListener, output);
-                std.debug.print("output {} has been created\n", .{output.name});
-            }
-        },
-        .global_remove => |remove| {
-            for (globals.outputs.items, 0..) |o, i| {
-                if (o.name == remove.name) {
-                    o.output.release();
-                    const output = globals.outputs.swapRemove(i);
-                    output.titlebar.destroy();
-                    std.debug.print("output {} is released\n", .{output.name});
-                    break;
-                }
-            }
-        },
-    }
-}
-
-fn outputListener(_: *wl.Output, event: wl.Output.Event, info: *Output) void {
-    switch (event) {
-        .mode => |mode| {
-            if (mode.flags.current) {
-                info.width = mode.width;
-                info.height = mode.height;
-            }
-        },
-        .scale => |scale_event| {
-            info.scale = scale_event.factor;
-        },
-        .geometry => {},
-        .done => {
-            info.done = true;
-            std.debug.print("Output {} info updated:\n  size={}x{}\n  scale={}\n", .{ info.name, info.height, info.width, info.scale });
-            info.titlebar.commit(info.scale);
-        },
-        else => {},
+    for (globals.wayland.outputs.items) |output| {
+        if (output.done) {
+            const titlebar: *LayerSurface = @ptrCast(@alignCast(output.data orelse @panic("Wayland Output data is null")));
+            titlebar.redraw();
+        }
     }
 }
 
 const LayerSurface = struct {
-    globals: *Globals,
+    wayland: *Wayland,
     surface: *wl.Surface,
     layer_surface: *zwlr.LayerSurfaceV1,
     width: u32 = 0,
@@ -294,7 +466,7 @@ const LayerSurface = struct {
 
     pub fn create(
         allocator: std.mem.Allocator,
-        globals: *Globals,
+        wls: *Wayland,
         output: ?*wl.Output,
         width: u32,
         height: u32,
@@ -305,8 +477,8 @@ const LayerSurface = struct {
         drawCallback: *const fn (surface: *const DrawableSurface, data: *DrawDataType) void,
         drawData: *DrawDataType,
     ) !*LayerSurface {
-        const compositor = globals.compositor orelse @panic("no Compositor");
-        const layer_shell = globals.layer_shell orelse @panic("no LayerShell");
+        const compositor = wls.compositor orelse @panic("no Compositor");
+        const layer_shell = wls.layer_shell orelse @panic("no LayerShell");
         const surface = try compositor.createSurface();
         const layer_surface = try layer_shell.getLayerSurface(
             surface,
@@ -321,7 +493,7 @@ const LayerSurface = struct {
 
         const layerSurface = try allocator.create(LayerSurface);
         layerSurface.* = .{
-            .globals = globals,
+            .wayland = wls,
             .surface = surface,
             .layer_surface = layer_surface,
             .drawCallback = @ptrCast(drawCallback),
@@ -366,7 +538,7 @@ const LayerSurface = struct {
             self.fd = null;
         }
 
-        self.globals.allocator.destroy(self);
+        self.wayland.allocator.destroy(self);
     }
 
     pub fn redraw(self: *LayerSurface) void {
@@ -395,7 +567,7 @@ const LayerSurface = struct {
     fn layerSurfaceListener(_: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, self: *LayerSurface) void {
         switch (event) {
             .configure => |configure| {
-                const shm = self.globals.shm orelse return;
+                const shm = self.wayland.shm orelse return;
 
                 self.width = configure.width * self.scale;
                 self.height = configure.height * self.scale;
