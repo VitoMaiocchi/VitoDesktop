@@ -17,6 +17,36 @@ const time = @cImport({
     @cInclude("time.h");
 });
 
+const pipewire = @cImport({
+    @cInclude("pipewire/context.h");
+    @cInclude("pipewire/core.h");
+    @cInclude("pipewire/stream.h");
+    @cInclude("pipewire/node.h");
+    @cInclude("pipewire/main-loop.h");
+});
+
+extern fn pw_init(argc: ?*c_int, argv: ?*?[*:0]u8) void;
+extern fn pw_deinit() void;
+
+fn pipewireHello() !void {
+    pw_init(null, null);
+    defer pw_deinit();
+
+    const loop = pipewire.pw_main_loop_new(null);
+    defer pipewire.pw_main_loop_destroy(loop);
+
+    const context = pipewire.pw_context_new(pipewire.pw_main_loop_get_loop(loop), null, 0);
+    defer pipewire.pw_context_destroy(context);
+
+    const core = pipewire.pw_context_connect(context, null, 0);
+    if (core == null) {
+        return error.PipeWireConnectionFailed;
+    }
+    defer _ = pipewire.pw_core_disconnect(core);
+
+    std.debug.print("Connected to PipeWire\n", .{});
+}
+
 const Globals = struct {
     allocator: std.mem.Allocator,
     titlebarState: *TitlebarState,
@@ -122,6 +152,7 @@ fn outputDestroy(_: *Wayland, output: *Wayland.Output, _: ?*anyopaque) !void {
 }
 
 pub fn main(init: std.process.Init) anyerror!void {
+    try pipewireHello();
     var now: time.time_t = time.time(null);
     var tm: time.struct_tm = undefined;
     _ = time.localtime_r(&now, &tm);

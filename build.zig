@@ -35,6 +35,13 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("wayland", wayland);
     exe.root_module.linkSystemLibrary("wayland-client", .{});
     exe.root_module.linkSystemLibrary("cairo", .{});
+    exe.root_module.linkSystemLibrary("pipewire-0.3", .{});
+    exe.root_module.addIncludePath(.{
+        .cwd_relative = "/usr/include/pipewire-0.3",
+    });
+    exe.root_module.addIncludePath(.{
+        .cwd_relative = "/usr/include/spa-0.2",
+    });
 
     b.installArtifact(exe);
 
