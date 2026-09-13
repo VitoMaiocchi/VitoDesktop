@@ -24,7 +24,7 @@ pub const Wayland = struct {
     compositor: ?*wl.Compositor,
     layer_shell: ?*zwlr.LayerShellV1,
     outputs: std.ArrayList(Output),
-    eventSources: std.ArrayList(EventSource),
+    eventSources: std.ArrayList(*const EventSource),
     createOutputFn: OutputFn,
     updateOutputFn: OutputFn,
     destroyOutputFn: OutputFn,
@@ -49,7 +49,7 @@ pub const Wayland = struct {
             .compositor = null,
             .layer_shell = null,
             .outputs = std.ArrayList(Output).empty,
-            .eventSources = std.ArrayList(EventSource).empty,
+            .eventSources = std.ArrayList(*const EventSource).empty,
             .createOutputFn = createOutputCallback,
             .updateOutputFn = updateOutputCallback,
             .destroyOutputFn = destroyOutputCallback,
@@ -61,7 +61,7 @@ pub const Wayland = struct {
         return self;
     }
 
-    pub fn registerEventSource(self: *Wayland, eventSource: EventSource) !void {
+    pub fn registerEventSource(self: *Wayland, eventSource: *const EventSource) !void {
         try self.eventSources.append(self.allocator, eventSource);
     }
 
@@ -118,10 +118,6 @@ pub const Wayland = struct {
                     try source.dispatch();
                 }
             }
-        }
-
-        for (self.eventSources.items) |source| {
-            linux.close(source.fd);
         }
     }
 

@@ -9,7 +9,7 @@ const LayerSurface = @import("wayland.zig").LayerSurface;
 const DrawableSurface = @import("types.zig").DrawableSurface;
 const EventSource = @import("types.zig").EventSource;
 
-const Hyprland = @import("event_sources/hyprland.zig");
+const Hyprland = @import("event_sources/hyprland.zig").Hyprland;
 const PipeWire = @import("event_sources/pipewire.zig");
 const Timer = @import("event_sources/timer.zig").Timer;
 
@@ -71,16 +71,22 @@ pub fn main(init: std.process.Init) anyerror!void {
         .wayland = wls,
     };
 
-    try globals.wayland.registerEventSource(try Hyprland.init(init));
+    const hyprland = try Hyprland.create(allocator, init);
+    defer hyprland.destroy();
 
-    const timerEvent = try Timer.init(allocator, Globals, timeCallback, &globals);
-    defer Timer.destroy(&timerEvent);
-    try globals.wayland.registerEventSource(timerEvent);
+    const timer = try Timer.create(allocator, Globals, timeCallback, &globals);
+    defer timer.destroy();
 
-    try globals.wayland.registerEventSource(try PipeWire.init());
+    const pipewireEvent = try PipeWire.init();
     defer PipeWire.cleanup();
 
+    try globals.wayland.registerEventSource(hyprland.eventSource);
+    try globals.wayland.registerEventSource(timer.eventSource);
+    try globals.wayland.registerEventSource(&pipewireEvent);
+
     try globals.wayland.runMainLoop();
+
+    _ = linux.close(pipewireEvent.fd);
 }
 
 fn updateTitlebarState(globals: *const Globals) void {
