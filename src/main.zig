@@ -10,7 +10,7 @@ const DrawableSurface = @import("types.zig").DrawableSurface;
 const EventSource = @import("types.zig").EventSource;
 
 const Hyprland = @import("event_sources/hyprland.zig").Hyprland;
-const PipeWire = @import("event_sources/pipewire.zig");
+const PipeWire = @import("event_sources/pipewire.zig").PipeWire;
 const Timer = @import("event_sources/timer.zig").Timer;
 
 const cairo = @cImport({
@@ -77,16 +77,14 @@ pub fn main(init: std.process.Init) anyerror!void {
     const timer = try Timer.create(allocator, Globals, timeCallback, &globals);
     defer timer.destroy();
 
-    const pipewireEvent = try PipeWire.init();
-    defer PipeWire.cleanup();
+    const pipewire = try PipeWire.create(allocator);
+    defer pipewire.destroy();
 
     try globals.wayland.registerEventSource(hyprland.eventSource);
     try globals.wayland.registerEventSource(timer.eventSource);
-    try globals.wayland.registerEventSource(&pipewireEvent);
+    try globals.wayland.registerEventSource(pipewire.eventSource);
 
     try globals.wayland.runMainLoop();
-
-    _ = linux.close(pipewireEvent.fd);
 }
 
 fn updateTitlebarState(globals: *const Globals) void {

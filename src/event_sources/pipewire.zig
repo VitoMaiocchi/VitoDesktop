@@ -128,74 +128,90 @@ fn registryCallback(
     }
 }
 
-fn dispatchPipeWire(event: *const EventSource) anyerror!void {
-    if (event.context == null) return;
-    const loop: *pipewire.struct_pw_loop = @ptrCast(@alignCast(event.context.?));
-    _ = pipewire.pw_loop_iterate(loop, 0);
-}
+pub const PipeWire = struct {
+    eventSource: *const EventSource,
+    allocator: std.mem.Allocator,
 
-var pw_main_loop: ?*pipewire.struct_pw_main_loop = null;
-var pw_loop: ?*pipewire.struct_pw_loop = null;
-var pw_context: ?*pipewire.struct_pw_context = null;
-var pw_core: ?*pipewire.struct_pw_core = null;
-var pw_registry: ?*pipewire.struct_pw_registry = null;
+    pw_main_loop: *pipewire.struct_pw_main_loop,
+    pw_loop: *pipewire.struct_pw_loop,
+    pw_context: *pipewire.struct_pw_context,
+    pw_core: *pipewire.struct_pw_core,
+    pw_registry: *pipewire.struct_pw_registry,
 
-var pw_registry_listener: pipewire.struct_spa_hook = undefined;
-var pw_registry_events = pipewire.struct_pw_registry_events{
-    .version = pipewire.PW_VERSION_REGISTRY_EVENTS,
-    .global = registryCallback,
+    pw_registry_listener: pipewire.struct_spa_hook,
+    pw_registry_events: pipewire.struct_pw_registry_events,
+
+    pub fn create(allocator: std.mem.Allocator) !*const PipeWire {
+        pw_init(null, null);
+
+        const pw_main_loop = pipewire.pw_main_loop_new(null);
+        if (pw_main_loop == null) return error.PipeWireLoopFailed;
+
+        const pw_loop = pipewire.pw_main_loop_get_loop(pw_main_loop.?);
+
+        const pw_context = pipewire.pw_context_new(pw_loop.?, null, 0);
+        if (pw_context == null) return error.PipeWireContextFailed;
+
+        const pw_core = pipewire.pw_context_connect(pw_context.?, null, 0);
+        if (pw_core == null) return error.PipeWireConnectionFailed;
+
+        const pw_registry = pipewire.pw_core_get_registry(
+            pw_core.?,
+            pipewire.PW_VERSION_REGISTRY,
+            0,
+        );
+        if (pw_registry == null) return error.PipeWireRegistyFailed;
+
+        const eventSource = try allocator.create(EventSource);
+        const self = try allocator.create(PipeWire);
+
+        self.* = .{
+            .allocator = allocator,
+            .eventSource = eventSource,
+            .pw_main_loop = pw_main_loop.?,
+            .pw_loop = pw_loop,
+            .pw_context = pw_context.?,
+            .pw_core = pw_core.?,
+            .pw_registry = pw_registry.?,
+            .pw_registry_listener = undefined,
+            .pw_registry_events = .{
+                .version = pipewire.PW_VERSION_REGISTRY_EVENTS,
+                .global = registryCallback,
+            },
+        };
+
+        _ = pipewire.pw_registry_add_listener(
+            pw_registry.?,
+            &self.pw_registry_listener,
+            &self.pw_registry_events,
+            pw_registry.?,
+        );
+
+        eventSource.* = .{
+            .fd = pipewire.pw_loop_get_fd(pw_loop.?),
+            .events = std.posix.POLL.IN,
+            .dispatchFn = dispatchPipeWire,
+            .context = pw_loop.?,
+        };
+
+        return self;
+    }
+
+    pub fn destroy(self: *const PipeWire) void {
+        _ = pipewire.pw_registry_destroy(self.pw_registry, 0);
+        _ = pipewire.pw_core_disconnect(self.pw_core);
+        pipewire.pw_context_destroy(self.pw_context);
+        pipewire.pw_main_loop_destroy(self.pw_main_loop);
+        pw_deinit();
+
+        _ = linux.close(self.eventSource.fd);
+        self.allocator.destroy(self.eventSource);
+        self.allocator.destroy(self);
+    }
+
+    fn dispatchPipeWire(event: *const EventSource) anyerror!void {
+        if (event.context == null) return;
+        const loop: *pipewire.struct_pw_loop = @ptrCast(@alignCast(event.context.?));
+        _ = pipewire.pw_loop_iterate(loop, 0);
+    }
 };
-
-pub fn init() !EventSource {
-    pw_init(null, null);
-
-    pw_main_loop = pipewire.pw_main_loop_new(null);
-    if (pw_main_loop == null) return error.PipeWireLoopFailed;
-
-    pw_loop = pipewire.pw_main_loop_get_loop(pw_main_loop.?);
-
-    pw_context = pipewire.pw_context_new(pw_loop.?, null, 0);
-    if (pw_context == null) return error.PipeWireContextFailed;
-
-    pw_core = pipewire.pw_context_connect(pw_context.?, null, 0);
-    if (pw_core == null) return error.PipeWireConnectionFailed;
-
-    std.debug.print("Connected to PipeWire\n", .{});
-
-    pw_registry = pipewire.pw_core_get_registry(
-        pw_core.?,
-        pipewire.PW_VERSION_REGISTRY,
-        0,
-    );
-
-    _ = pipewire.pw_registry_add_listener(
-        pw_registry.?,
-        &pw_registry_listener,
-        &pw_registry_events,
-        pw_registry.?,
-    );
-
-    return .{
-        .fd = pipewire.pw_loop_get_fd(pw_loop.?),
-        .events = std.posix.POLL.IN,
-        .dispatchFn = dispatchPipeWire,
-        .context = pw_loop.?,
-    };
-}
-
-pub fn cleanup() void {
-    if (pw_registry) |registry| {
-        _ = pipewire.pw_registry_destroy(registry, 0);
-    }
-    if (pw_core) |core| {
-        _ = pipewire.pw_core_disconnect(core);
-    }
-    if (pw_context) |context| {
-        pipewire.pw_context_destroy(context);
-    }
-    if (pw_main_loop) |main_loop| {
-        pipewire.pw_main_loop_destroy(main_loop);
-    }
-
-    pw_deinit();
-}
