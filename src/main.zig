@@ -8,6 +8,7 @@ const LayerSurface = @import("wayland.zig").LayerSurface;
 
 const DrawableSurface = @import("types.zig").DrawableSurface;
 const EventSource = @import("types.zig").EventSource;
+const Format = @import("types.zig").Format;
 
 const Hyprland = @import("event_sources/hyprland.zig").Hyprland;
 const PipeWire = @import("event_sources/pipewire.zig").PipeWire;
@@ -171,10 +172,14 @@ fn drawTitlebar(surface: *const DrawableSurface, state: *const TitlebarState) vo
     const volumeSlice = std.fmt.bufPrint(&volumeBuf, "Volume: {d}%", .{state.volume}) catch "?%";
     volumeBuf[volumeSlice.len] = 0;
 
+    const format = switch (surface.format) {
+        Format.ARGB8888 => cairo.CAIRO_FORMAT_ARGB32,
+    };
+
     // Wrap the mmap'd memory as a Cairo surface — no copy, same bytes.
     const cairo_surface = cairo.cairo_image_surface_create_for_data(
         surface.data,
-        surface.format,
+        format,
         surface.width,
         surface.height,
         surface.stride,

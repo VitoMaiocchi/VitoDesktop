@@ -1,8 +1,8 @@
 const std = @import("std");
 
-const cairo = @cImport({
-    @cInclude("cairo/cairo.h");
-});
+pub const Format = enum {
+    ARGB8888,
+};
 
 pub const EventSource = struct {
     fd: std.posix.fd_t,
@@ -18,7 +18,7 @@ pub const EventSource = struct {
 
 pub const DrawableSurface = struct {
     data: [*c]u8,
-    format: cairo.cairo_format_t,
+    format: Format,
     width: c_int,
     height: c_int,
     stride: c_int,

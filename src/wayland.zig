@@ -7,12 +7,9 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zwlr = wayland.client.zwlr;
 
-const cairo = @cImport({
-    @cInclude("cairo/cairo.h");
-});
-
 const EventSource = @import("types.zig").EventSource;
 const DrawableSurface = @import("types.zig").DrawableSurface;
+const Format = @import("types.zig").Format;
 
 pub const Wayland = struct {
     const OutputFn = *const fn (wayland: *Wayland, output: *Output, data: ?*anyopaque) anyerror!void;
@@ -322,7 +319,7 @@ pub const LayerSurface = struct {
 
         const s = DrawableSurface{
             .data = &(self.data.?)[self.stride * self.height * buffer],
-            .format = cairo.CAIRO_FORMAT_ARGB32,
+            .format = Format.ARGB8888,
             .width = @intCast(self.width),
             .height = @intCast(self.height),
             .stride = @intCast(self.stride),
