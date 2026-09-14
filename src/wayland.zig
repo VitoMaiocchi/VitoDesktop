@@ -150,7 +150,7 @@ pub const Wayland = struct {
                     };
                     const output = &self.outputs.items[self.outputs.items.len - 1];
                     wlOutput.setListener(*Wayland, outputListener, self);
-                    std.debug.print("output {} has been created\n", .{output.name});
+                    //std.debug.print("output {} has been created\n", .{output.name});
                     self.createOutputFn(self, output, self.data) catch {
                         //TODO: better error handling
                         std.debug.print("ERROR", .{});
@@ -163,7 +163,7 @@ pub const Wayland = struct {
                     if (o.name == remove.name) {
                         o.output.release();
                         var output = self.outputs.swapRemove(i);
-                        std.debug.print("output {} is released\n", .{output.name});
+                        // std.debug.print("output {} is released\n", .{output.name});
                         self.destroyOutputFn(self, &output, self.data) catch {
                             //TODO: better error handling
                             std.debug.print("ERROR", .{});
@@ -197,7 +197,7 @@ pub const Wayland = struct {
             .geometry => {},
             .done => {
                 output.done = true;
-                std.debug.print("Output {} info updated:\n  size={}x{}\n  scale={}\n", .{ output.name, output.height, output.width, output.scale });
+                // std.debug.print("Output {} info updated:\n  size={}x{}\n  scale={}\n", .{ output.name, output.height, output.width, output.scale });
                 self.updateOutputFn(self, output, self.data) catch {
                     //TODO: better error handling
                     std.debug.print("ERROR", .{});
@@ -255,7 +255,7 @@ pub const LayerSurface = struct {
             surface,
             output,
             layer,
-            "hello-zig-wayland",
+            "vito-desktop-wayland",
         );
 
         layer_surface.setAnchor(anchor);
@@ -348,7 +348,7 @@ pub const LayerSurface = struct {
                 const size = self.stride * self.height;
 
                 if (self.fd == null) {
-                    self.fd = posix.memfd_create("hello-zig-wayland", 0) catch {
+                    self.fd = posix.memfd_create("vito-desktop-wayland", 0) catch {
                         std.debug.print("ERROR: layersurface memfd create failed", .{});
                         return;
                     };

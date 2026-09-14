@@ -41,6 +41,11 @@ pub const PipeWire = struct {
     nodes: std.StringHashMap(u32),
     defaultAudioSinkId: ?u32 = null,
 
+    fn setDefaultSinkId(self: *PipeWire, id: u32) void {
+        self.defaultAudioSinkId = id;
+        //std.debug.print("DEFAULT SINK ID = {}\n", .{self.defaultAudioSinkId.?});
+    }
+
     fn defaultCallback(
         data: ?*anyopaque,
         _: u32,
@@ -54,7 +59,7 @@ pub const PipeWire = struct {
             const v = std.mem.span(value);
 
             // v is JSON: {"name":"..."}
-            std.debug.print("default output = {s}\n", .{v});
+            //std.debug.print("default output = {s}\n", .{v});
 
             const parsed = std.json.parseFromSlice(
                 struct { name: []const u8 },
@@ -64,13 +69,12 @@ pub const PipeWire = struct {
             ) catch return 0;
             defer parsed.deinit();
 
-            std.debug.print("default name = \"{s}\" \n", .{parsed.value.name});
+            //std.debug.print("default name = \"{s}\" \n", .{parsed.value.name});
 
             self.defaultAudioSink = std.heap.page_allocator.dupe(u8, parsed.value.name) catch return 0;
             if (self.defaultAudioSinkId == null) {
                 if (self.nodes.get(parsed.value.name)) |id| {
-                    self.defaultAudioSinkId = id;
-                    std.debug.print("DEFAULT SINK ID = {}\n", .{self.defaultAudioSinkId.?});
+                    self.setDefaultSinkId(id);
                 }
             }
         }
@@ -135,12 +139,11 @@ pub const PipeWire = struct {
             for (dict.items[0..dict.n_items]) |item| {
                 if (std.mem.eql(u8, std.mem.span(item.key), "node.name")) {
                     const node_name: []const u8 = std.mem.span(item.value);
-                    std.debug.print("node: {s}, id: {}\n", .{ node_name, id });
+                    //std.debug.print("node: {s}, id: {}\n", .{ node_name, id });
 
                     if (self.defaultAudioSink != null) {
                         if (std.mem.eql(u8, self.defaultAudioSink.?, node_name)) {
-                            self.defaultAudioSinkId = id;
-                            std.debug.print("DEFAULT SINK ID = {}\n", .{self.defaultAudioSinkId.?});
+                            self.setDefaultSinkId(id);
                         }
                     }
 
