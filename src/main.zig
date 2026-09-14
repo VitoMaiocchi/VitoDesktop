@@ -31,6 +31,7 @@ const TitlebarState = struct {
     currentTime: time.struct_tm,
     activeWindow: [256]u8 = undefined,
     activeWindowLen: usize = 0,
+    volume: u32 = 0,
 };
 
 fn timeCallback(now: c_long, globals: *Globals) void {
@@ -79,6 +80,12 @@ fn activeMonitorCallback(title: []const u8, globals: *Globals) void {
     updateTitlebarState(globals);
 }
 
+fn volumeCallback(volume: u32, globals: *Globals) void {
+    const state: *TitlebarState = globals.titlebarState;
+    state.volume = volume;
+    updateTitlebarState(globals);
+}
+
 pub fn main(init: std.process.Init) anyerror!void {
     var now: time.time_t = time.time(null);
     var tm: time.struct_tm = undefined;
@@ -118,7 +125,12 @@ pub fn main(init: std.process.Init) anyerror!void {
     );
     defer timer.destroy();
 
-    const pipewire = try PipeWire.create(allocator);
+    const pipewire = try PipeWire.create(
+        allocator,
+        Globals,
+        volumeCallback,
+        &globals,
+    );
     defer pipewire.destroy();
 
     try globals.wayland.registerEventSource(hyprland.eventSource);
@@ -155,6 +167,10 @@ fn drawTitlebar(surface: *const DrawableSurface, state: *const TitlebarState) vo
     @memcpy(activeBuf[0..activeLen], state.activeWindow[0..activeLen]);
     activeBuf[activeLen] = 0;
 
+    var volumeBuf: [32:0]u8 = undefined;
+    const volumeSlice = std.fmt.bufPrint(&volumeBuf, "Volume: {d}%", .{state.volume}) catch "?%";
+    volumeBuf[volumeSlice.len] = 0;
+
     // Wrap the mmap'd memory as a Cairo surface — no copy, same bytes.
     const cairo_surface = cairo.cairo_image_surface_create_for_data(
         surface.data,
@@ -179,6 +195,9 @@ fn drawTitlebar(surface: *const DrawableSurface, state: *const TitlebarState) vo
     cairo.cairo_show_text(cr, &timeBuf);
 
     cairo.cairo_move_to(cr, 200 * s, 25 * s);
+    cairo.cairo_show_text(cr, &volumeBuf);
+
+    cairo.cairo_move_to(cr, 350 * s, 25 * s);
     cairo.cairo_show_text(cr, &activeBuf);
     // --- end draw ---
 

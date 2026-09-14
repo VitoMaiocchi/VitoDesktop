@@ -10,14 +10,25 @@ const pipewire = @cImport({
     @cInclude("pipewire/node.h");
     @cInclude("pipewire/main-loop.h");
     @cInclude("pipewire/extensions/metadata.h");
+
+    @cInclude("spa/param/props.h");
+    @cInclude("spa/param/param.h");
+    @cInclude("spa/pod/pod.h");
+    @cInclude("spa/pod/parser.h");
+    @cInclude("spa/pod/iter.h");
+    @cInclude("spa/utils/dict.h");
 });
 
 extern fn pw_init(argc: ?*c_int, argv: ?*?[*:0]u8) void;
 extern fn pw_deinit() void;
 
+//TODO: handle when the default audio source switches
+
 pub const PipeWire = struct {
     eventSource: *const EventSource,
     allocator: std.mem.Allocator,
+    updateVolume: *const fn (u32, *anyopaque) void,
+    data: *anyopaque,
 
     pw_main_loop: *pipewire.struct_pw_main_loop,
     pw_loop: *pipewire.struct_pw_loop,
@@ -41,8 +52,90 @@ pub const PipeWire = struct {
     nodes: std.StringHashMap(u32),
     defaultAudioSinkId: ?u32 = null,
 
+    pw_node: ?*pipewire.struct_pw_node = null,
+    node_listener: pipewire.struct_spa_hook = undefined,
+    node_events: pipewire.struct_pw_node_events = .{
+        .version = pipewire.PW_VERSION_NODE_EVENTS,
+        .param = onNodeParam,
+    },
+
+    volume: f32 = 0.0,
+
+    fn onNodeParam(
+        data: ?*anyopaque,
+        _: c_int,
+        id: u32,
+        _: u32,
+        _: u32,
+        param: [*c]const pipewire.struct_spa_pod,
+    ) callconv(.c) void {
+        if (id != pipewire.SPA_PARAM_Props or param == null) return;
+        const self: *PipeWire = @ptrCast(@alignCast(data.?));
+
+        const base: [*]const u8 = @ptrCast(param);
+        const pod_size = std.mem.readInt(u32, base[0..4], .little);
+        const obj_body = base + 8; // past pod header {size,type}
+        // skip object body {body_type, body_id} (8 bytes)
+        var cursor: [*]const u8 = obj_body + 8;
+        const end: [*]const u8 = obj_body + pod_size; // pod_size covers body_type+body_id+props
+
+        while (@intFromPtr(cursor) < @intFromPtr(end)) {
+            const key = std.mem.readInt(u32, cursor[0..4], .little);
+            // skip key(4) + flags(4)
+            const value_hdr = cursor + 8;
+            const value_size = std.mem.readInt(u32, value_hdr[0..4], .little);
+            const value_type = std.mem.readInt(u32, value_hdr[4..8], .little);
+            const value_body = value_hdr + 8;
+
+            if (key == pipewire.SPA_PROP_channelVolumes and value_type == pipewire.SPA_TYPE_Array) {
+                const child_size = std.mem.readInt(u32, value_body[0..4], .little);
+                const n = (value_size - 8) / child_size;
+                const floats: [*]const f32 = @ptrCast(@alignCast(value_body + 8));
+
+                var sum: f32 = 0;
+                for (0..n) |i| sum += floats[i];
+                self.volume = sum / @as(f32, @floatFromInt(n));
+
+                const percent = std.math.cbrt(self.volume) * 100.0;
+                self.updateVolume(@intFromFloat(@round(percent)), self.data);
+                return;
+            }
+
+            // advance to next prop: 8 (key+flags) + 8 (value pod header) + value_size, 8-byte aligned
+            const entry_len = 16 + value_size;
+            const aligned_len = (entry_len + 7) & ~@as(u32, 7);
+            cursor += aligned_len;
+        }
+    }
+
+    fn subscribeVolume(self: *PipeWire) void {
+        const id = self.defaultAudioSinkId orelse return;
+        if (self.pw_node != null) return; // already bound
+
+        const node_ptr = pipewire.pw_registry_bind(
+            self.pw_registry,
+            id,
+            pipewire.PW_TYPE_INTERFACE_Node,
+            pipewire.PW_VERSION_NODE,
+            0,
+        );
+        if (node_ptr == null) return;
+        self.pw_node = @ptrCast(node_ptr.?);
+
+        _ = pipewire.pw_node_add_listener(
+            self.pw_node.?,
+            &self.node_listener,
+            &self.node_events,
+            self,
+        );
+
+        var ids = [_]u32{pipewire.SPA_PARAM_Props};
+        _ = pipewire.pw_node_subscribe_params(self.pw_node.?, &ids, ids.len);
+    }
+
     fn setDefaultSinkId(self: *PipeWire, id: u32) void {
         self.defaultAudioSinkId = id;
+        self.subscribeVolume();
         //std.debug.print("DEFAULT SINK ID = {}\n", .{self.defaultAudioSinkId.?});
     }
 
@@ -155,7 +248,7 @@ pub const PipeWire = struct {
         }
     }
 
-    pub fn create(allocator: std.mem.Allocator) !*PipeWire {
+    pub fn create(allocator: std.mem.Allocator, T: type, updateVolume: *const fn (u32, *T) void, data: *T) !*PipeWire {
         pw_init(null, null);
 
         const pw_main_loop = pipewire.pw_main_loop_new(null);
@@ -182,6 +275,8 @@ pub const PipeWire = struct {
         self.* = .{
             .allocator = allocator,
             .eventSource = eventSource,
+            .updateVolume = @ptrCast(updateVolume),
+            .data = data,
             .pw_main_loop = pw_main_loop.?,
             .pw_loop = pw_loop,
             .pw_context = pw_context.?,
