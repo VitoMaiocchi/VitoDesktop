@@ -8,11 +8,16 @@ const time = @cImport({
 
 pub const Timer = struct {
     allocator: std.mem.Allocator,
+    eventSource: *const EventSource,
     callback: *const fn (c_long, *anyopaque) void,
     data: *anyopaque,
-    eventSource: *const EventSource,
 
-    pub fn create(allocator: std.mem.Allocator, T: type, callback: *const fn (c_long, *T) void, data: *T) !*const Timer {
+    pub fn create(
+        allocator: std.mem.Allocator,
+        T: type,
+        callback: *const fn (c_long, *T) void,
+        data: *T,
+    ) !*const Timer {
         const fd: i32 = @intCast(linux.timerfd_create(linux.timerfd_clockid_t.MONOTONIC, .{}));
 
         var spec = linux.itimerspec{
@@ -33,9 +38,9 @@ pub const Timer = struct {
 
         self.* = .{
             .allocator = allocator,
+            .eventSource = eventSource,
             .callback = @ptrCast(callback),
             .data = data,
-            .eventSource = eventSource,
         };
 
         eventSource.* = .{

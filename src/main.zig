@@ -15,6 +15,8 @@ const PipeWire = @import("event_sources/pipewire.zig").PipeWire;
 const Timer = @import("event_sources/timer.zig").Timer;
 const NetworkManager = @import("event_sources/networkmanager.zig").NetworkManager;
 
+const NetworkStatus = @import("event_sources/networkmanager.zig").NetworkStatus;
+
 const cairo = @cImport({
     @cInclude("cairo/cairo.h");
 });
@@ -88,6 +90,23 @@ fn volumeCallback(volume: u32, globals: *Globals) void {
     updateTitlebarState(globals);
 }
 
+fn networkCallback(status: *NetworkStatus, globals: *Globals) void {
+    switch (status.kind) {
+        .wifi => {
+            const ssid = status.ssidSlice();
+            const ip = status.ipSlice();
+            if (status.wifi_quality) |q| {
+                std.debug.print("Network: wifi ({s}, {d}%) ip={s}\n", .{ ssid, q, ip });
+            } else {
+                std.debug.print("Network: wifi ({s}) ip={s}\n", .{ ssid, ip });
+            }
+        },
+        .ethernet => std.debug.print("Network: ethernet ip={s}\n", .{status.ipSlice()}),
+        else => std.debug.print("Network: {s}\n", .{status.label()}),
+    }
+    _ = globals;
+}
+
 pub fn main(init: std.process.Init) anyerror!void {
     var now: time.time_t = time.time(null);
     var tm: time.struct_tm = undefined;
@@ -135,7 +154,12 @@ pub fn main(init: std.process.Init) anyerror!void {
     );
     defer pipewire.destroy();
 
-    const networkmanager = try NetworkManager.create(allocator);
+    const networkmanager = try NetworkManager.create(
+        allocator,
+        Globals,
+        networkCallback,
+        &globals,
+    );
     defer networkmanager.destroy();
 
     try globals.wayland.registerEventSource(hyprland.eventSource);

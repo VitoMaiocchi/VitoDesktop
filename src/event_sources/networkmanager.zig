@@ -71,10 +71,18 @@ fn copyPath(dest: *[PATH_BUF_LEN]u8, src: [*:0]const u8) ?[*:0]const u8 {
 pub const NetworkManager = struct {
     allocator: std.mem.Allocator,
     eventSource: *EventSource,
+    callback: *const fn (*NetworkStatus, *anyopaque) void,
+    data: *anyopaque,
+
     connection: *dbus.struct_DBusConnection,
     status: NetworkStatus,
 
-    pub fn create(allocator: std.mem.Allocator) !*NetworkManager {
+    pub fn create(
+        allocator: std.mem.Allocator,
+        T: type,
+        callback: *const fn (*NetworkStatus, *T) void,
+        data: *T,
+    ) !*NetworkManager {
         const connection = dbus.dbus_bus_get(dbus.DBUS_BUS_SYSTEM, null) orelse
             return error.DBusConnect;
         errdefer dbus.dbus_connection_unref(connection);
@@ -88,6 +96,8 @@ pub const NetworkManager = struct {
         self.* = .{
             .allocator = allocator,
             .eventSource = eventSource,
+            .callback = @ptrCast(callback),
+            .data = data,
             .connection = connection,
             .status = .{ .kind = .disconnected },
         };
@@ -211,23 +221,7 @@ pub const NetworkManager = struct {
 
         if (!statusEqual(&self.status, &new_status)) {
             self.status = new_status;
-            self.printStatus();
-        }
-    }
-
-    fn printStatus(self: *const NetworkManager) void {
-        switch (self.status.kind) {
-            .wifi => {
-                const ssid = self.status.ssidSlice();
-                const ip = self.status.ipSlice();
-                if (self.status.wifi_quality) |q| {
-                    std.debug.print("Network: wifi ({s}, {d}%) ip={s}\n", .{ ssid, q, ip });
-                } else {
-                    std.debug.print("Network: wifi ({s}) ip={s}\n", .{ ssid, ip });
-                }
-            },
-            .ethernet => std.debug.print("Network: ethernet ip={s}\n", .{self.status.ipSlice()}),
-            else => std.debug.print("Network: {s}\n", .{self.status.label()}),
+            self.callback(&self.status, self.data);
         }
     }
 
