@@ -42,6 +42,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addIncludePath(.{
         .cwd_relative = "/usr/include/spa-0.2",
     });
+    exe.root_module.linkSystemLibrary("dbus-1", .{});
+    exe.root_module.addIncludePath(.{
+        .cwd_relative = "/usr/include/dbus-1.0",
+    });
 
     b.installArtifact(exe);
 

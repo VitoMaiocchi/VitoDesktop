@@ -13,6 +13,7 @@ const Format = @import("types.zig").Format;
 const Hyprland = @import("event_sources/hyprland.zig").Hyprland;
 const PipeWire = @import("event_sources/pipewire.zig").PipeWire;
 const Timer = @import("event_sources/timer.zig").Timer;
+const NetworkManager = @import("event_sources/networkmanager.zig").NetworkManager;
 
 const cairo = @cImport({
     @cInclude("cairo/cairo.h");
@@ -134,9 +135,13 @@ pub fn main(init: std.process.Init) anyerror!void {
     );
     defer pipewire.destroy();
 
+    const networkmanager = try NetworkManager.create(allocator);
+    defer networkmanager.destroy();
+
     try globals.wayland.registerEventSource(hyprland.eventSource);
     try globals.wayland.registerEventSource(timer.eventSource);
     try globals.wayland.registerEventSource(pipewire.eventSource);
+    try globals.wayland.registerEventSource(networkmanager.eventSource);
 
     try globals.wayland.runMainLoop();
 }

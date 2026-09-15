@@ -18,11 +18,11 @@ pub const Timer = struct {
         var spec = linux.itimerspec{
             .it_interval = .{
                 .sec = 1,
-                .nsec = 0, // 0.5 s
+                .nsec = 0,
             },
             .it_value = .{
                 .sec = 1,
-                .nsec = 0, // first expiration after 0.5 s
+                .nsec = 0,
             },
         };
 
