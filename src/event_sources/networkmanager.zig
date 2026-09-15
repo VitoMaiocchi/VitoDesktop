@@ -9,6 +9,7 @@ const NM = "org.freedesktop.NetworkManager";
 const NM_DEVICE = "org.freedesktop.NetworkManager.Device";
 const NM_WIRELESS = "org.freedesktop.NetworkManager.Device.Wireless";
 const NM_AP = "org.freedesktop.NetworkManager.AccessPoint";
+const NM_IP4_CONFIG = "org.freedesktop.NetworkManager.IP4Config";
 const DBUS_PROPS = "org.freedesktop.DBus.Properties";
 
 const MATCH_NM = "type='signal',interface='org.freedesktop.NetworkManager',member='StateChanged'";
@@ -20,6 +21,8 @@ const NM_DEVICE_WIFI: u32 = 2;
 const NM_DEVICE_PREPARE: u32 = 40;
 const NM_DEVICE_SECONDARIES: u32 = 90;
 const NM_DEVICE_ACTIVATED: u32 = 100;
+
+const PATH_BUF_LEN: usize = 256;
 
 pub const NetworkStatus = struct {
     pub const Kind = enum {
@@ -33,9 +36,16 @@ pub const NetworkStatus = struct {
     kind: Kind,
     ssid: [64]u8 = undefined,
     ssid_len: usize = 0,
+    wifi_quality: ?u8 = null,
+    ip: [16]u8 = undefined,
+    ip_len: usize = 0,
 
     pub fn ssidSlice(self: *const NetworkStatus) []const u8 {
         return self.ssid[0..self.ssid_len];
+    }
+
+    pub fn ipSlice(self: *const NetworkStatus) []const u8 {
+        return self.ip[0..self.ip_len];
     }
 
     pub fn label(self: *const NetworkStatus) []const u8 {
@@ -48,6 +58,15 @@ pub const NetworkStatus = struct {
         };
     }
 };
+
+fn copyPath(dest: *[PATH_BUF_LEN]u8, src: [*:0]const u8) ?[*:0]const u8 {
+    const span = std.mem.span(src);
+    if (span.len == 0 or span.len >= dest.len) return null;
+    @memcpy(dest[0..span.len], span);
+    dest[span.len] = 0;
+    const p: [*:0]u8 = @ptrCast(dest);
+    return p;
+}
 
 pub const NetworkManager = struct {
     allocator: std.mem.Allocator,
@@ -124,8 +143,10 @@ pub const NetworkManager = struct {
         var array: dbus.DBusMessageIter = undefined;
         dbus.dbus_message_iter_recurse(&iter, &array);
 
-        var wifi_connected: ?[*:0]const u8 = null;
-        var ethernet_connected = false;
+        var wifi_device_buf: [PATH_BUF_LEN]u8 = undefined;
+        var wifi_device: ?[*:0]const u8 = null;
+        var ethernet_device_buf: [PATH_BUF_LEN]u8 = undefined;
+        var ethernet_device: ?[*:0]const u8 = null;
         var wifi_connecting = false;
         var ethernet_connecting = false;
 
@@ -148,14 +169,14 @@ pub const NetworkManager = struct {
             switch (device_type) {
                 NM_DEVICE_WIFI => {
                     if (state == NM_DEVICE_ACTIVATED) {
-                        wifi_connected = device_path;
+                        if (copyPath(&wifi_device_buf, device_path)) |p| wifi_device = p;
                     } else if (connecting) {
                         wifi_connecting = true;
                     }
                 },
                 NM_DEVICE_ETHERNET => {
                     if (state == NM_DEVICE_ACTIVATED) {
-                        ethernet_connected = true;
+                        if (copyPath(&ethernet_device_buf, device_path)) |p| ethernet_device = p;
                     } else if (connecting) {
                         ethernet_connecting = true;
                     }
@@ -168,13 +189,20 @@ pub const NetworkManager = struct {
 
         var new_status: NetworkStatus = .{ .kind = .disconnected };
 
-        if (wifi_connected) |device| {
+        if (wifi_device) |device| {
             new_status.kind = .wifi;
-            self.fillWifiSsid(&new_status, device) catch {
+            self.fillWifiInfo(&new_status, device) catch {
                 new_status.ssid_len = 0;
+                new_status.wifi_quality = null;
             };
-        } else if (ethernet_connected) {
+            self.fillIp(&new_status, device) catch {
+                new_status.ip_len = 0;
+            };
+        } else if (ethernet_device) |device| {
             new_status.kind = .ethernet;
+            self.fillIp(&new_status, device) catch {
+                new_status.ip_len = 0;
+            };
         } else if (wifi_connecting) {
             new_status.kind = .connecting_wifi;
         } else if (ethernet_connecting) {
@@ -189,20 +217,33 @@ pub const NetworkManager = struct {
 
     fn printStatus(self: *const NetworkManager) void {
         switch (self.status.kind) {
-            .wifi => std.debug.print("Network: wifi ({s})\n", .{self.status.ssidSlice()}),
+            .wifi => {
+                const ssid = self.status.ssidSlice();
+                const ip = self.status.ipSlice();
+                if (self.status.wifi_quality) |q| {
+                    std.debug.print("Network: wifi ({s}, {d}%) ip={s}\n", .{ ssid, q, ip });
+                } else {
+                    std.debug.print("Network: wifi ({s}) ip={s}\n", .{ ssid, ip });
+                }
+            },
+            .ethernet => std.debug.print("Network: ethernet ip={s}\n", .{self.status.ipSlice()}),
             else => std.debug.print("Network: {s}\n", .{self.status.label()}),
         }
     }
 
-    fn fillWifiSsid(
+    fn fillWifiInfo(
         self: *NetworkManager,
         status: *NetworkStatus,
         device: [*:0]const u8,
     ) !void {
-        const ap = (try self.getObjectPathProperty(device, NM_WIRELESS, "ActiveAccessPoint")) orelse {
-            status.ssid_len = 0;
-            return;
-        };
+        status.ssid_len = 0;
+        status.wifi_quality = null;
+
+        const ap_opt = try self.getObjectPathProperty(device, NM_WIRELESS, "ActiveAccessPoint");
+        const ap_raw = ap_opt orelse return;
+
+        var ap_buf: [PATH_BUF_LEN]u8 = undefined;
+        const ap = copyPath(&ap_buf, ap_raw) orelse return;
 
         const reply = try self.getProperty(ap, NM_AP, "Ssid");
         defer dbus.dbus_message_unref(reply);
@@ -228,6 +269,74 @@ pub const NetworkManager = struct {
         }
 
         status.ssid_len = len;
+        status.wifi_quality = self.getU8Property(ap, NM_AP, "Strength") catch null;
+    }
+
+    fn fillIp(self: *NetworkManager, status: *NetworkStatus, device: [*:0]const u8) !void {
+        status.ip_len = 0;
+
+        const config_opt = try self.getObjectPathProperty(device, NM_DEVICE, "Ip4Config");
+        const config_raw = config_opt orelse return;
+
+        var config_buf: [PATH_BUF_LEN]u8 = undefined;
+        const config = copyPath(&config_buf, config_raw) orelse return;
+
+        const reply = try self.getProperty(config, NM_IP4_CONFIG, "Addresses");
+        defer dbus.dbus_message_unref(reply);
+
+        var variant: dbus.DBusMessageIter = undefined;
+        try getVariant(reply, &variant);
+
+        if (dbus.dbus_message_iter_get_arg_type(&variant) != dbus.DBUS_TYPE_ARRAY)
+            return error.BadReply;
+
+        var outer: dbus.DBusMessageIter = undefined;
+        dbus.dbus_message_iter_recurse(&variant, &outer);
+
+        while (dbus.dbus_message_iter_get_arg_type(&outer) != dbus.DBUS_TYPE_INVALID) {
+            if (dbus.dbus_message_iter_get_arg_type(&outer) != dbus.DBUS_TYPE_ARRAY) {
+                _ = dbus.dbus_message_iter_next(&outer);
+                continue;
+            }
+
+            var inner: dbus.DBusMessageIter = undefined;
+            dbus.dbus_message_iter_recurse(&outer, &inner);
+
+            if (dbus.dbus_message_iter_get_arg_type(&inner) == dbus.DBUS_TYPE_UINT32) {
+                var addr: u32 = 0;
+                dbus.dbus_message_iter_get_basic(&inner, @ptrCast(&addr));
+                const octets: [4]u8 = @bitCast(addr);
+                const s = std.fmt.bufPrint(
+                    status.ip[0..],
+                    "{d}.{d}.{d}.{d}",
+                    .{ octets[0], octets[1], octets[2], octets[3] },
+                ) catch return error.BadReply;
+                status.ip_len = s.len;
+                return;
+            }
+
+            _ = dbus.dbus_message_iter_next(&outer);
+        }
+    }
+
+    fn getU8Property(
+        self: *NetworkManager,
+        object: [*:0]const u8,
+        interface: [*:0]const u8,
+        property: [*:0]const u8,
+    ) !u8 {
+        const reply = try self.getProperty(object, interface, property);
+        defer dbus.dbus_message_unref(reply);
+
+        var variant: dbus.DBusMessageIter = undefined;
+        try getVariant(reply, &variant);
+
+        if (dbus.dbus_message_iter_get_arg_type(&variant) != dbus.DBUS_TYPE_BYTE)
+            return error.BadReply;
+
+        var value: u8 = 0;
+        dbus.dbus_message_iter_get_basic(&variant, @ptrCast(&value));
+        return value;
     }
 
     fn getU32Property(
@@ -337,6 +446,10 @@ fn getVariant(reply: *dbus.struct_DBusMessage, out: *dbus.DBusMessageIter) !void
 
 fn statusEqual(a: *const NetworkStatus, b: *const NetworkStatus) bool {
     if (a.kind != b.kind) return false;
-    if (a.kind == .wifi) return std.mem.eql(u8, a.ssidSlice(), b.ssidSlice());
+    if (a.kind == .wifi) {
+        if (!std.mem.eql(u8, a.ssidSlice(), b.ssidSlice())) return false;
+        if (a.wifi_quality != b.wifi_quality) return false;
+    }
+    if (!std.mem.eql(u8, a.ipSlice(), b.ipSlice())) return false;
     return true;
 }
