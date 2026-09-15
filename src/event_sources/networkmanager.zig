@@ -5,16 +5,19 @@ const dbus = @cImport({
     @cInclude("dbus/dbus.h");
 });
 
-//AI SLOP CODE
+const NM = "org.freedesktop.NetworkManager";
+const NM_DEVICE = "org.freedesktop.NetworkManager.Device";
+const NM_WIRELESS = "org.freedesktop.NetworkManager.Device.Wireless";
+const NM_AP = "org.freedesktop.NetworkManager.AccessPoint";
+const DBUS_PROPS = "org.freedesktop.DBus.Properties";
+
+const MATCH_NM = "type='signal',interface='org.freedesktop.NetworkManager',member='StateChanged'";
+const MATCH_DEVICE = "type='signal',interface='org.freedesktop.NetworkManager.Device',member='StateChanged'";
+const MATCH_PROPS = "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'";
 
 const NM_DEVICE_ETHERNET: u32 = 1;
 const NM_DEVICE_WIFI: u32 = 2;
-
 const NM_DEVICE_PREPARE: u32 = 40;
-const NM_DEVICE_CONFIG: u32 = 50;
-const NM_DEVICE_NEED_AUTH: u32 = 60;
-const NM_DEVICE_IP_CONFIG: u32 = 70;
-const NM_DEVICE_IP_CHECK: u32 = 80;
 const NM_DEVICE_SECONDARIES: u32 = 90;
 const NM_DEVICE_ACTIVATED: u32 = 100;
 
@@ -28,7 +31,6 @@ pub const NetworkStatus = struct {
     };
 
     kind: Kind,
-
     ssid: [64]u8 = undefined,
     ssid_len: usize = 0,
 
@@ -51,15 +53,12 @@ pub const NetworkManager = struct {
     allocator: std.mem.Allocator,
     eventSource: *EventSource,
     connection: *dbus.struct_DBusConnection,
-
     status: NetworkStatus,
 
     pub fn create(allocator: std.mem.Allocator) !*NetworkManager {
-        const connection =
-            dbus.dbus_bus_get(
-                dbus.DBUS_BUS_SYSTEM,
-                null,
-            ) orelse return error.DBusConnect;
+        const connection = dbus.dbus_bus_get(dbus.DBUS_BUS_SYSTEM, null) orelse
+            return error.DBusConnect;
+        errdefer dbus.dbus_connection_unref(connection);
 
         const self = try allocator.create(NetworkManager);
         errdefer allocator.destroy(self);
@@ -71,40 +70,17 @@ pub const NetworkManager = struct {
             .allocator = allocator,
             .eventSource = eventSource,
             .connection = connection,
-            .status = .{
-                .kind = .disconnected,
-            },
+            .status = .{ .kind = .disconnected },
         };
 
-        dbus.dbus_bus_add_match(
-            connection,
-            "type='signal',interface='org.freedesktop.NetworkManager',member='StateChanged'",
-            null,
-        );
-
-        dbus.dbus_bus_add_match(
-            connection,
-            "type='signal',interface='org.freedesktop.NetworkManager.Device',member='StateChanged'",
-            null,
-        );
-
-        dbus.dbus_bus_add_match(
-            connection,
-            "type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
-            null,
-        );
-
+        dbus.dbus_bus_add_match(connection, MATCH_NM, null);
+        dbus.dbus_bus_add_match(connection, MATCH_DEVICE, null);
+        dbus.dbus_bus_add_match(connection, MATCH_PROPS, null);
         dbus.dbus_connection_flush(connection);
 
         var fd: c_int = -1;
-
-        if (dbus.dbus_connection_get_unix_fd(
-            connection,
-            &fd,
-        ) == 0) {
-            dbus.dbus_connection_unref(connection);
+        if (dbus.dbus_connection_get_unix_fd(connection, &fd) == 0)
             return error.NoFd;
-        }
 
         eventSource.* = .{
             .fd = fd,
@@ -114,134 +90,60 @@ pub const NetworkManager = struct {
         };
 
         try self.refresh();
-
         return self;
     }
 
     fn dispatch(event: *const EventSource) anyerror!void {
-        const self: *NetworkManager =
-            @ptrCast(@alignCast(event.context.?));
+        const self: *NetworkManager = @ptrCast(@alignCast(event.context.?));
 
-        _ = dbus.dbus_connection_read_write(
-            self.connection,
-            0,
-        );
+        _ = dbus.dbus_connection_read_write(self.connection, 0);
 
-        var msg =
-            dbus.dbus_connection_pop_message(
-                self.connection,
-            );
+        while (dbus.dbus_connection_pop_message(self.connection)) |msg| {
+            defer dbus.dbus_message_unref(msg);
 
-        while (msg != null) {
-            const current_msg = msg.?;
-
-            defer dbus.dbus_message_unref(current_msg);
-
-            const is_nm_state =
-                dbus.dbus_message_is_signal(
-                    current_msg,
-                    "org.freedesktop.NetworkManager",
-                    "StateChanged",
-                ) != 0;
-
-            const is_device_state =
-                dbus.dbus_message_is_signal(
-                    current_msg,
-                    "org.freedesktop.NetworkManager.Device",
-                    "StateChanged",
-                ) != 0;
-
-            const is_properties_changed =
-                dbus.dbus_message_is_signal(
-                    current_msg,
-                    "org.freedesktop.DBus.Properties",
-                    "PropertiesChanged",
-                ) != 0;
-
-            if (is_nm_state or is_device_state or is_properties_changed) {
+            if (dbus.dbus_message_is_signal(msg, NM, "StateChanged") != 0 or
+                dbus.dbus_message_is_signal(msg, NM_DEVICE, "StateChanged") != 0 or
+                dbus.dbus_message_is_signal(msg, DBUS_PROPS, "PropertiesChanged") != 0)
+            {
                 self.refresh() catch |err| {
-                    std.log.err(
-                        "NetworkManager refresh failed: {}",
-                        .{err},
-                    );
+                    std.log.err("NetworkManager refresh failed: {}", .{err});
                 };
             }
-
-            msg = dbus.dbus_connection_pop_message(
-                self.connection,
-            );
         }
     }
 
     fn refresh(self: *NetworkManager) !void {
-        const reply = try self.callMethod(
-            "/org/freedesktop/NetworkManager",
-            "org.freedesktop.NetworkManager",
-            "GetDevices",
-        );
+        const reply = try self.callMethod("/org/freedesktop/NetworkManager", NM, "GetDevices");
         defer dbus.dbus_message_unref(reply);
 
         var iter: dbus.DBusMessageIter = undefined;
-
-        if (dbus.dbus_message_iter_init(
-            reply,
-            &iter,
-        ) == 0) {
+        if (dbus.dbus_message_iter_init(reply, &iter) == 0 or
+            dbus.dbus_message_iter_get_arg_type(&iter) != dbus.DBUS_TYPE_ARRAY)
             return error.BadReply;
-        }
-
-        if (dbus.dbus_message_iter_get_arg_type(
-            &iter,
-        ) != dbus.DBUS_TYPE_ARRAY) {
-            return error.BadReply;
-        }
 
         var array: dbus.DBusMessageIter = undefined;
-
-        dbus.dbus_message_iter_recurse(
-            &iter,
-            &array,
-        );
+        dbus.dbus_message_iter_recurse(&iter, &array);
 
         var wifi_connected: ?[*:0]const u8 = null;
         var ethernet_connected = false;
-
         var wifi_connecting = false;
         var ethernet_connecting = false;
 
-        while (dbus.dbus_message_iter_get_arg_type(
-            &array,
-        ) != dbus.DBUS_TYPE_INVALID) {
+        while (dbus.dbus_message_iter_get_arg_type(&array) != dbus.DBUS_TYPE_INVALID) {
             var device_path: [*:0]const u8 = undefined;
+            dbus.dbus_message_iter_get_basic(&array, @ptrCast(&device_path));
 
-            dbus.dbus_message_iter_get_basic(
-                &array,
-                @as(?*anyopaque, @ptrCast(&device_path)),
-            );
+            const device_type = self.getU32Property(device_path, NM_DEVICE, "DeviceType") catch {
+                _ = dbus.dbus_message_iter_next(&array);
+                continue;
+            };
 
-            const device_type =
-                self.getU32Property(
-                    device_path,
-                    "org.freedesktop.NetworkManager.Device",
-                    "DeviceType",
-                ) catch {
-                    _ = dbus.dbus_message_iter_next(&array);
-                    continue;
-                };
+            const state = self.getU32Property(device_path, NM_DEVICE, "State") catch {
+                _ = dbus.dbus_message_iter_next(&array);
+                continue;
+            };
 
-            const state =
-                self.getU32Property(
-                    device_path,
-                    "org.freedesktop.NetworkManager.Device",
-                    "State",
-                ) catch {
-                    _ = dbus.dbus_message_iter_next(&array);
-                    continue;
-                };
-
-            const connecting =
-                state >= NM_DEVICE_PREPARE and
-                state <= NM_DEVICE_SECONDARIES;
+            const connecting = state >= NM_DEVICE_PREPARE and state <= NM_DEVICE_SECONDARIES;
 
             switch (device_type) {
                 NM_DEVICE_WIFI => {
@@ -251,7 +153,6 @@ pub const NetworkManager = struct {
                         wifi_connecting = true;
                     }
                 },
-
                 NM_DEVICE_ETHERNET => {
                     if (state == NM_DEVICE_ACTIVATED) {
                         ethernet_connected = true;
@@ -259,24 +160,17 @@ pub const NetworkManager = struct {
                         ethernet_connecting = true;
                     }
                 },
-
                 else => {},
             }
 
             _ = dbus.dbus_message_iter_next(&array);
         }
 
-        var new_status: NetworkStatus = .{
-            .kind = .disconnected,
-        };
+        var new_status: NetworkStatus = .{ .kind = .disconnected };
 
         if (wifi_connected) |device| {
             new_status.kind = .wifi;
-
-            self.fillWifiSsid(
-                &new_status,
-                device,
-            ) catch {
+            self.fillWifiSsid(&new_status, device) catch {
                 new_status.ssid_len = 0;
             };
         } else if (ethernet_connected) {
@@ -287,10 +181,7 @@ pub const NetworkManager = struct {
             new_status.kind = .connecting_ethernet;
         }
 
-        if (!statusEqual(
-            &self.status,
-            &new_status,
-        )) {
+        if (!statusEqual(&self.status, &new_status)) {
             self.status = new_status;
             self.printStatus();
         }
@@ -298,15 +189,8 @@ pub const NetworkManager = struct {
 
     fn printStatus(self: *const NetworkManager) void {
         switch (self.status.kind) {
-            .wifi => std.debug.print(
-                "Network: wifi ({s})\n",
-                .{self.status.ssidSlice()},
-            ),
-
-            else => std.debug.print(
-                "Network: {s}\n",
-                .{self.status.label()},
-            ),
+            .wifi => std.debug.print("Network: wifi ({s})\n", .{self.status.ssidSlice()}),
+            else => std.debug.print("Network: {s}\n", .{self.status.label()}),
         }
     }
 
@@ -315,77 +199,31 @@ pub const NetworkManager = struct {
         status: *NetworkStatus,
         device: [*:0]const u8,
     ) !void {
-        const active_ap =
-            try self.getObjectPathProperty(
-                device,
-                "org.freedesktop.NetworkManager.Device.Wireless",
-                "ActiveAccessPoint",
-            );
-
-        const ap = active_ap orelse {
+        const ap = (try self.getObjectPathProperty(device, NM_WIRELESS, "ActiveAccessPoint")) orelse {
             status.ssid_len = 0;
             return;
         };
 
-        const reply = try self.getProperty(
-            ap,
-            "org.freedesktop.NetworkManager.AccessPoint",
-            "Ssid",
-        );
+        const reply = try self.getProperty(ap, NM_AP, "Ssid");
         defer dbus.dbus_message_unref(reply);
 
-        var iter: dbus.DBusMessageIter = undefined;
-
-        if (dbus.dbus_message_iter_init(
-            reply,
-            &iter,
-        ) == 0) {
-            return error.BadReply;
-        }
-
-        if (dbus.dbus_message_iter_get_arg_type(
-            &iter,
-        ) != dbus.DBUS_TYPE_VARIANT) {
-            return error.BadReply;
-        }
-
         var variant: dbus.DBusMessageIter = undefined;
+        try getVariant(reply, &variant);
 
-        dbus.dbus_message_iter_recurse(
-            &iter,
-            &variant,
-        );
-
-        if (dbus.dbus_message_iter_get_arg_type(
-            &variant,
-        ) != dbus.DBUS_TYPE_ARRAY) {
+        if (dbus.dbus_message_iter_get_arg_type(&variant) != dbus.DBUS_TYPE_ARRAY)
             return error.BadReply;
-        }
 
         var bytes: dbus.DBusMessageIter = undefined;
-
-        dbus.dbus_message_iter_recurse(
-            &variant,
-            &bytes,
-        );
+        dbus.dbus_message_iter_recurse(&variant, &bytes);
 
         var len: usize = 0;
-
         while (len < status.ssid.len and
-            dbus.dbus_message_iter_get_arg_type(
-                &bytes,
-            ) != dbus.DBUS_TYPE_INVALID)
+            dbus.dbus_message_iter_get_arg_type(&bytes) != dbus.DBUS_TYPE_INVALID)
         {
             var byte: u8 = 0;
-
-            dbus.dbus_message_iter_get_basic(
-                &bytes,
-                @as(?*anyopaque, @ptrCast(&byte)),
-            );
-
+            dbus.dbus_message_iter_get_basic(&bytes, @ptrCast(&byte));
             status.ssid[len] = byte;
             len += 1;
-
             _ = dbus.dbus_message_iter_next(&bytes);
         }
 
@@ -398,48 +236,17 @@ pub const NetworkManager = struct {
         interface: [*:0]const u8,
         property: [*:0]const u8,
     ) !u32 {
-        const reply = try self.getProperty(
-            object,
-            interface,
-            property,
-        );
+        const reply = try self.getProperty(object, interface, property);
         defer dbus.dbus_message_unref(reply);
 
-        var iter: dbus.DBusMessageIter = undefined;
-
-        if (dbus.dbus_message_iter_init(
-            reply,
-            &iter,
-        ) == 0) {
-            return error.BadReply;
-        }
-
-        if (dbus.dbus_message_iter_get_arg_type(
-            &iter,
-        ) != dbus.DBUS_TYPE_VARIANT) {
-            return error.BadReply;
-        }
-
         var variant: dbus.DBusMessageIter = undefined;
+        try getVariant(reply, &variant);
 
-        dbus.dbus_message_iter_recurse(
-            &iter,
-            &variant,
-        );
-
-        if (dbus.dbus_message_iter_get_arg_type(
-            &variant,
-        ) != dbus.DBUS_TYPE_UINT32) {
+        if (dbus.dbus_message_iter_get_arg_type(&variant) != dbus.DBUS_TYPE_UINT32)
             return error.BadReply;
-        }
 
         var value: u32 = 0;
-
-        dbus.dbus_message_iter_get_basic(
-            &variant,
-            @as(?*anyopaque, @ptrCast(&value)),
-        );
-
+        dbus.dbus_message_iter_get_basic(&variant, @ptrCast(&value));
         return value;
     }
 
@@ -449,48 +256,17 @@ pub const NetworkManager = struct {
         interface: [*:0]const u8,
         property: [*:0]const u8,
     ) !?[*:0]const u8 {
-        const reply = try self.getProperty(
-            object,
-            interface,
-            property,
-        );
+        const reply = try self.getProperty(object, interface, property);
         defer dbus.dbus_message_unref(reply);
 
-        var iter: dbus.DBusMessageIter = undefined;
-
-        if (dbus.dbus_message_iter_init(
-            reply,
-            &iter,
-        ) == 0) {
-            return error.BadReply;
-        }
-
-        if (dbus.dbus_message_iter_get_arg_type(
-            &iter,
-        ) != dbus.DBUS_TYPE_VARIANT) {
-            return error.BadReply;
-        }
-
         var variant: dbus.DBusMessageIter = undefined;
+        try getVariant(reply, &variant);
 
-        dbus.dbus_message_iter_recurse(
-            &iter,
-            &variant,
-        );
-
-        if (dbus.dbus_message_iter_get_arg_type(
-            &variant,
-        ) != dbus.DBUS_TYPE_OBJECT_PATH) {
+        if (dbus.dbus_message_iter_get_arg_type(&variant) != dbus.DBUS_TYPE_OBJECT_PATH)
             return error.BadReply;
-        }
 
         var path: [*:0]const u8 = undefined;
-
-        dbus.dbus_message_iter_get_basic(
-            &variant,
-            @as(?*anyopaque, @ptrCast(&path)),
-        );
-
+        dbus.dbus_message_iter_get_basic(&variant, @ptrCast(&path));
         return path;
     }
 
@@ -500,13 +276,8 @@ pub const NetworkManager = struct {
         interface: [*:0]const u8,
         property: [*:0]const u8,
     ) !*dbus.struct_DBusMessage {
-        const msg = dbus.dbus_message_new_method_call(
-            "org.freedesktop.NetworkManager",
-            object,
-            "org.freedesktop.DBus.Properties",
-            "Get",
-        ) orelse return error.OutOfMemory;
-
+        const msg = dbus.dbus_message_new_method_call(NM, object, DBUS_PROPS, "Get") orelse
+            return error.OutOfMemory;
         defer dbus.dbus_message_unref(msg);
 
         var interface_ptr: [*:0]const u8 = interface;
@@ -519,9 +290,7 @@ pub const NetworkManager = struct {
             dbus.DBUS_TYPE_STRING,
             @as(?*anyopaque, @ptrCast(&property_ptr)),
             dbus.DBUS_TYPE_INVALID,
-        ) == 0) {
-            return error.OutOfMemory;
-        }
+        ) == 0) return error.OutOfMemory;
 
         return dbus.dbus_connection_send_with_reply_and_block(
             self.connection,
@@ -537,13 +306,8 @@ pub const NetworkManager = struct {
         interface: [*:0]const u8,
         method: [*:0]const u8,
     ) !*dbus.struct_DBusMessage {
-        const msg = dbus.dbus_message_new_method_call(
-            "org.freedesktop.NetworkManager",
-            object,
-            interface,
-            method,
-        ) orelse return error.OutOfMemory;
-
+        const msg = dbus.dbus_message_new_method_call(NM, object, interface, method) orelse
+            return error.OutOfMemory;
         defer dbus.dbus_message_unref(msg);
 
         return dbus.dbus_connection_send_with_reply_and_block(
@@ -556,27 +320,23 @@ pub const NetworkManager = struct {
 
     pub fn destroy(self: *NetworkManager) void {
         dbus.dbus_connection_unref(self.connection);
-
         self.allocator.destroy(self.eventSource);
         self.allocator.destroy(self);
     }
 };
 
-fn statusEqual(
-    a: *const NetworkStatus,
-    b: *const NetworkStatus,
-) bool {
-    if (a.kind != b.kind) {
-        return false;
-    }
+fn getVariant(reply: *dbus.struct_DBusMessage, out: *dbus.DBusMessageIter) !void {
+    var iter: dbus.DBusMessageIter = undefined;
 
-    if (a.kind == .wifi) {
-        return std.mem.eql(
-            u8,
-            a.ssidSlice(),
-            b.ssidSlice(),
-        );
-    }
+    if (dbus.dbus_message_iter_init(reply, &iter) == 0 or
+        dbus.dbus_message_iter_get_arg_type(&iter) != dbus.DBUS_TYPE_VARIANT)
+        return error.BadReply;
 
+    dbus.dbus_message_iter_recurse(&iter, out);
+}
+
+fn statusEqual(a: *const NetworkStatus, b: *const NetworkStatus) bool {
+    if (a.kind != b.kind) return false;
+    if (a.kind == .wifi) return std.mem.eql(u8, a.ssidSlice(), b.ssidSlice());
     return true;
 }
